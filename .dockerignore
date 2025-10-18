@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Rust
+target/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# HLS 출력 (볼륨으로 마운트되므로 제외)
+hls_output/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+README.md
+*.md
+
+# Environment files
+.env
+.env.local
+.env.*.local

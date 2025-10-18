@@ -1,0 +1,24 @@
+[server]
+host = "0.0.0.0"
+port = 1935
+segment_delay = 3
+
+[hls]
+save_dir = "hls_output"
+segment_duration = 0.5
+part_duration = 0.1
+max_segments = 6
+max_parts = 3
+enable_server_push = true
+enable_preload_hint = true
+target_latency = 1.5
+
+[api]
+host=
+
+[s3]
+bucket =
+region =
+access_key =
+secret_access_key =
+endpoint_uri =
