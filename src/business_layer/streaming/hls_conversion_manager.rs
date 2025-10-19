@@ -127,12 +127,18 @@ impl HlsConversionManager {
         stream_id: u32,
         s3_storage: &Arc<S3Storage>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let output_dir = PathBuf::from(&self.output_dir).join(format!("{}_{}", stream_name, stream_id));
+        let output_dir = PathBuf::from(&self.output_dir).join(stream_name);
         let stream_name_clone = stream_name.to_string();
-        let s3_prefix = format!("hls_output/{}_{}", stream_name, stream_id);
+        let s3_prefix = format!("hls_output/{}", stream_name);
         let s3_storage_clone = s3_storage.clone();
 
         tokio::spawn(async move {
+            // 출력 디렉토리가 존재하지 않으면 생성
+            if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
+                eprintln!("❌ Failed to create output directory {}: {}", output_dir.display(), e);
+                return;
+            }
+
             // S3 파일 감시기 생성
             if let Some(upload_sender) = &s3_storage_clone.upload_sender {
                 use crate::data_layer::storage::s3_file_watcher::S3FileWatcher;
