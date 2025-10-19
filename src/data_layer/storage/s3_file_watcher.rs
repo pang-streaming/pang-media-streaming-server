@@ -72,7 +72,7 @@ impl S3FileWatcher {
                 for path in paths {
                     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                         // HLS 세그먼트 파일인지 확인
-                        if file_name.ends_with(".ts") || file_name.ends_with(".m3u8") || file_name.ends_with(".m4s") || file_name.ends_with(".mp4") {
+                        if file_name.ends_with(".ts") || file_name.ends_with(".m3u8") || file_name.ends_with(".m4s") || file_name.ends_with(".mp4") || file_name.ends_with(".jpg") || file_name.ends_with(".png") {
                             pending_files.insert(path.clone());
                         }
                     }
@@ -151,6 +151,8 @@ impl S3FileWatcher {
             Some("mp4") => "video/mp4",
             Some("ts") => "video/mp2t",
             Some("json") => "application/json",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("png") => "image/png",
             _ => "application/octet-stream",
         }
     }

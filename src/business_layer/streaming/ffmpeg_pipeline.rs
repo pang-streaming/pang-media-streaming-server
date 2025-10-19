@@ -45,6 +45,7 @@ impl FfmpegPipelineManager {
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
+            "-y",
             "-i", "pipe:0",
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -69,6 +70,12 @@ impl FfmpegPipelineManager {
             "-hls_start_number_source", "datetime",
             "-hls_base_url", &hls_base_url,
             &playlist_path,
+            "-map", "0:v:0",
+            "-vf", "fps=1/10,scale=640:-1",
+            "-q:v", "2",
+            "-update", "1",
+            "-f", "image2",
+            &format!("{}/thumbnail.jpg", output_dir),
         ]);
 
         cmd.stdin(Stdio::piped());

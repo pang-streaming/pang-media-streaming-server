@@ -140,6 +140,8 @@ impl S3Storage {
             Some("mp4") => "video/mp4",
             Some("ts") => "video/mp2t",
             Some("json") => "application/json",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("png") => "image/png",
             _ => "application/octet-stream",
         }
     }
