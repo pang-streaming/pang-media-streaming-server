@@ -13,14 +13,14 @@ pub struct BaseStreamUserResponse {
 
 #[derive(Deserialize, Debug)]
 pub struct StreamUserResponse {
-    nickname: String,
+    username: String,
     #[serde(rename = "createdAt")]
     created_at: String
 }
 
 impl StreamUserResponse {
-    pub fn get_nickname(&self) -> String {
-        self.nickname.clone()
+    pub fn get_username(&self) -> String {
+        self.username.clone()
     }
 
     pub fn get_start_time(&self) -> String {

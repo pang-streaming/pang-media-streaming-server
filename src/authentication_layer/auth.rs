@@ -6,5 +6,5 @@ pub async fn authenticate_and_get_stream_id(stream_key: &str, client: &Client, a
     let response: StreamUserResponse = get_authentication(stream_key, client, api_config).await
         .expect("Authentication failed")
         .data;
-    Ok(format!("{}/{}", response.get_nickname(), response.get_start_time()))
+    Ok(format!("{}/{}", response.get_username(), response.get_start_time()))
 }
