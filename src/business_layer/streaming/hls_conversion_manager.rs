@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use crate::config::Config;
+use crate::config::{ApiConfig, Config};
 use crate::business_layer::monitoring::{MetricsCollector, LatencyMonitor};
 use crate::business_layer::streaming::ll_hls::{
     playlist_generator::LLHLSPlaylistGenerator,
@@ -22,6 +22,7 @@ pub struct HlsConversionManager {
     latency_monitor: Arc<LatencyMonitor>,
     s3_storage: Option<Arc<S3Storage>>,
     output_dir: String,
+    pub api_config: ApiConfig,
 }
 
 impl HlsConversionManager {
@@ -64,6 +65,7 @@ impl HlsConversionManager {
             latency_monitor,
             s3_storage,
             output_dir,
+            api_config: config.api.clone(),
         })
     }
 

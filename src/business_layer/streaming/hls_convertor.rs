@@ -82,4 +82,8 @@ impl HlsConvertor {
     pub fn has_stream(&self, stream_id: u32) -> bool {
         self.conversion_manager.has_stream(stream_id)
     }
+
+    pub fn api_config(&self) -> &crate::config::ApiConfig {
+        &self.conversion_manager.api_config
+    }
 }

@@ -1,9 +1,9 @@
 use reqwest::Client;
-use crate::authentication_layer::authentication_request::response::{BaseStreamUserResponse};
+use crate::{authentication_layer::authentication_request::response::{BaseStreamUserResponse}, config::ApiConfig};
 
-pub async fn get_authentication(stream_key: &str, client: &Client) -> Result<BaseStreamUserResponse, String> {
+pub async fn get_authentication(stream_key: &str, client: &Client, api_config: &ApiConfig) -> Result<BaseStreamUserResponse, String> {
     let data = client
-        .post("http://localhost:8080/stream")
+        .post(format!("{}/stream", api_config.host))
         .header("X-Stream-Key", stream_key)
         .send().await
         .unwrap();
