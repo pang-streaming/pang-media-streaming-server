@@ -39,7 +39,7 @@ impl FfmpegPipelineManager {
 
         // FFmpeg 명령어 구성 (LL-HLS 최적화)
         let segment_filename_pattern = format!("{}/segment_%d.m4s", output_dir);
-        let hls_base_url = format!("https://{}.s3.{}.amazonaws.com/hls_output/{}/", &self.config.s3.bucket, &self.config.s3.region, stream_name);
+        let hls_base_url = format!("{}/hls_output/{}/", &self.config.s3.endpoint_uri, stream_name);
         let playlist_path = format!("{}/playlist.m3u8", output_dir);
         
 
