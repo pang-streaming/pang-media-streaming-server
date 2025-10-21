@@ -85,9 +85,6 @@ impl HlsConversionManager {
             }
         }
 
-        // 메트릭 기록 (기존 메서드가 없으므로 주석 처리)
-        // self.metrics_collector.record_stream_start(stream_name).await?;
-
         Ok(())
     }
 
@@ -99,10 +96,6 @@ impl HlsConversionManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // FFmpeg 파이프라인 중지
         self.ffmpeg_manager.stop_pipeline(stream_id)?;
-
-        // 메트릭 기록 (기존 메서드가 없으므로 주석 처리)
-        // self.metrics_collector.record_stream_end(stream_name).await?;
-
         println!("🛑 HLS conversion stopped for stream {} (key: {})", stream_id, stream_name);
         Ok(())
     }
@@ -115,9 +108,6 @@ impl HlsConversionManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // FFmpeg 파이프라인에 데이터 전송
         self.ffmpeg_manager.send_data(stream_id, data)?;
-
-        // 메트릭 업데이트
-        // self.metrics_collector.record_data_processed(stream_id, data.len()).await?;
 
         Ok(())
     }

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use reqwest::Client;
 use scuffle_rtmp::session::server::{ServerSessionError, SessionHandler, SessionData};
-use crate::authentication_layer::auth::authenticate_and_get_stream_id;
+use crate::authentication_layer::auth::{authenticate_and_get_stream_id, stop_stream};
 use crate::business_layer::streaming::hls_convertor::HlsConvertor;
 
 /// RTMP 세션 핸들러
@@ -12,6 +12,7 @@ pub struct RtmpSessionHandler {
     http_client: Client,
     internal_stream_id: Option<u32>,
     authed_stream_id: Option<String>,
+    stream_key: Option<String>,
 }
 
 impl RtmpSessionHandler {
@@ -22,18 +23,20 @@ impl RtmpSessionHandler {
             http_client: Client::new(),
             internal_stream_id: None,
             authed_stream_id: None,
+            stream_key: None,
         }
     }
 
     /// 스트림키를 가공하여 파라미터를 제거하고 깔끔한 경로로 변환
-    fn sanitize_stream_key(&self, stream_key: &str) -> String {
+    fn sanitize_stream_key(&mut self, stream_key: &str) -> String {
         // URL 파라미터 제거 (? 이후의 모든 내용)
-        if let Some(query_pos) = stream_key.find('?') {
+        let user_key = if let Some(query_pos) = stream_key.find('?') {
             &stream_key[..query_pos]
         } else {
             stream_key
-        }
-        .to_string()
+        }.to_string();
+        self.stream_key = Option::from(user_key.clone());
+        user_key
     }
 
     /// 스트림키(정제된)를 바탕으로 내부 스트림 ID(u32)를 결정적으로 생성
@@ -55,10 +58,10 @@ impl SessionHandler for RtmpSessionHandler {
         stream_key: &str,
     ) -> Result<(), ServerSessionError> {
         println!("📡 RTMP publish request: stream_key={}", stream_key);
-        let stream_name = self.sanitize_stream_key(stream_key);
+        let encoded_stream_key = self.sanitize_stream_key(stream_key);
 
         let api_config = self.hls_convertor.api_config();
-        let authed_stream_id = authenticate_and_get_stream_id(&stream_name, &self.http_client, api_config).await?;
+        let authed_stream_id = authenticate_and_get_stream_id(&encoded_stream_key, &self.http_client, api_config).await?;
         
         let internal_stream_id = Self::generate_stream_id(&authed_stream_id);
         self.internal_stream_id = Some(internal_stream_id);
@@ -98,6 +101,8 @@ impl SessionHandler for RtmpSessionHandler {
         if let Err(e) = self.hls_convertor.stop_hls_conversion(internal_id, &name).await {
             eprintln!("Failed to stop HLS conversion: {}", e);
         }
+
+        stop_stream(self.stream_key.clone(), &self.http_client, self.hls_convertor.api_config()).await;
         Ok(())
     }
 
