@@ -102,7 +102,10 @@ impl SessionHandler for RtmpSessionHandler {
             eprintln!("Failed to stop HLS conversion: {}", e);
         }
 
-        stop_stream(self.stream_key.clone(), &self.http_client, self.hls_convertor.api_config()).await;
+        if let Some(ref stream_key) = self.stream_key {
+            stop_stream(stream_key, &self.http_client, self.hls_convertor.api_config()).await;
+        }
+
         Ok(())
     }
 
