@@ -4,8 +4,7 @@ use std::fs;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub server: ServerConfig,
-    pub hls: HlsConfig,
-    pub adaptive_bitrate: AdaptiveBitrateConfig,
+    pub streaming: StreamingConfig,
     pub api: ApiConfig,
     pub s3: S3Config,
 }
@@ -13,33 +12,16 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub host: String,
-    pub segment_delay: u32,
     pub port: u16,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct HlsConfig {
-    pub save_dir: String,
-    pub segment_duration: f64,
-    pub part_duration: f64,
-    pub max_segments: u32,
-    pub max_parts: u32,
-    pub enable_server_push: bool,
-    pub enable_preload_hint: bool,
-    pub target_latency: f64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct AdaptiveBitrateConfig {
-    pub enabled: bool,
-    pub variants: Vec<BitrateVariant>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct BitrateVariant {
-    pub bandwidth: u32,
-    pub resolution: String,
-    pub name: String,
+pub struct StreamingConfig {
+    pub segment_duration: f64,      // 세그먼트 길이 (초)
+    pub target_latency: f64,        // 목표 지연시간 (초)
+    pub memory_buffer_mb: usize,    // 메모리 버퍼 크기 (MB)
+    pub max_segments_per_stream: usize,  // 스트림당 최대 세그먼트 수
+    pub upload_workers: usize,      // S3 업로드 워커 수
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -61,5 +43,18 @@ impl Config {
         let toml_str = fs::read_to_string("config.toml")?;
         let config: Config = toml::from_str(&toml_str)?;
         Ok(config)
+    }
+}
+
+// 기본 설정값 제공
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            segment_duration: 0.5,
+            target_latency: 2.0,
+            memory_buffer_mb: 500,
+            max_segments_per_stream: 20,
+            upload_workers: 10,
+        }
     }
 }

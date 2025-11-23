@@ -1,0 +1,294 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use tokio::sync::{RwLock, Semaphore, mpsc};
+use log::{info, warn, error};
+use aws_sdk_s3::Client;
+use aws_sdk_s3::primitives::ByteStream;
+use chrono::Utc;
+use futures::future::join_all;
+
+/// 메모리 세그먼트 데이터
+#[derive(Clone)]
+pub struct MemorySegment {
+    pub stream_name: String,
+    pub file_name: String,
+    pub data: Vec<u8>,
+    pub content_type: String,
+    pub priority: u8, // 0 = lowest, 255 = highest
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub retry_count: u8,
+}
+
+/// 업로드 작업 상태
+#[derive(Debug, Clone)]
+pub enum UploadState {
+    Pending,
+    Uploading,
+    Completed,
+    Failed(String),
+}
+
+/// 업로드 작업
+pub struct UploadTask {
+    pub segment: MemorySegment,
+    pub state: UploadState,
+    pub attempt: u8,
+}
+
+/// 메모리 기반 S3 업로더
+pub struct MemoryS3Uploader {
+    client: Arc<Client>,
+    bucket: String,
+    upload_queue: Arc<RwLock<VecDeque<MemorySegment>>>,
+    active_uploads: Arc<RwLock<HashMap<String, UploadState>>>,
+    worker_semaphore: Arc<Semaphore>,
+    max_retries: u8,
+    shutdown_tx: mpsc::Sender<()>,
+    shutdown_rx: Arc<RwLock<Option<mpsc::Receiver<()>>>>,
+}
+
+impl MemoryS3Uploader {
+    /// 새로운 메모리 S3 업로더 생성
+    pub async fn new(
+        client: Arc<Client>,
+        bucket: String,
+        worker_count: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        Ok(Self {
+            client,
+            bucket,
+            upload_queue: Arc::new(RwLock::new(VecDeque::new())),
+            active_uploads: Arc::new(RwLock::new(HashMap::new())),
+            worker_semaphore: Arc::new(Semaphore::new(worker_count)),
+            max_retries: 3,
+            shutdown_tx,
+            shutdown_rx: Arc::new(RwLock::new(Some(shutdown_rx))),
+        })
+    }
+
+    /// 세그먼트를 업로드 큐에 추가 (메모리에서 직접)
+    pub async fn queue_segment(&self, segment: MemorySegment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut queue = self.upload_queue.write().await;
+
+        // 우선순위에 따라 큐에 삽입
+        let insert_pos = queue.iter().position(|s| s.priority < segment.priority).unwrap_or(queue.len());
+        queue.insert(insert_pos, segment.clone());
+
+        // 바로 업로드 작업 시작
+        self.spawn_upload_worker().await;
+
+        Ok(())
+    }
+
+    /// 업로드 워커 생성
+    async fn spawn_upload_worker(&self) {
+        let queue = Arc::clone(&self.upload_queue);
+        let client = Arc::clone(&self.client);
+        let bucket = self.bucket.clone();
+        let semaphore = Arc::clone(&self.worker_semaphore);
+        let active_uploads = Arc::clone(&self.active_uploads);
+        let max_retries = self.max_retries;
+
+        tokio::spawn(async move {
+            // 동시 업로드 수 제한
+            let _permit = semaphore.acquire().await.ok()?;
+
+            // 큐에서 세그먼트 가져오기
+            let segment = {
+                let mut q = queue.write().await;
+                q.pop_front()
+            }?;
+
+            let key = format!("{}/{}", segment.stream_name, segment.file_name);
+
+            // 업로드 상태 업데이트
+            {
+                let mut uploads = active_uploads.write().await;
+                uploads.insert(key.clone(), UploadState::Uploading);
+            }
+
+            // 재시도 로직 포함 업로드
+            let mut retry_count = 0;
+            let mut last_error = None;
+
+            while retry_count <= max_retries {
+                match Self::upload_to_s3(&client, &bucket, &key, &segment).await {
+                    Ok(_) => {
+                        // 성공
+                        let mut uploads = active_uploads.write().await;
+                        uploads.insert(key.clone(), UploadState::Completed);
+
+                        info!("S3 Upload Success: {}", key);
+                        return Some(());
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        last_error = Some(format!("{:?}", e)); // 더 자세한 에러 정보
+
+                        if retry_count <= max_retries {
+                            warn!("S3 Upload Failed (retry {}/{}): {}",
+                                retry_count, max_retries, key);
+                            error!("Error details: {:?}", e);
+
+                            // dispatch failure는 보통 네트워크 또는 자격 증명 문제
+                            if e.to_string().contains("dispatch failure") {
+                                info!("Possible causes: Network issue, invalid credentials, or wrong region");
+                            }
+
+                            // 지수 백오프
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(retry_count as u32 - 1))).await;
+                        }
+                    }
+                }
+            }
+
+            // 최종 실패
+            let mut uploads = active_uploads.write().await;
+            uploads.insert(key.clone(), UploadState::Failed(last_error.unwrap_or_else(|| "Unknown error".to_string())));
+
+            error!("S3 Upload Failed after {} retries: {}", max_retries, key);
+            None
+        });
+    }
+
+    /// S3에 실제 업로드
+    async fn upload_to_s3(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        segment: &MemorySegment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let body = ByteStream::from(segment.data.clone());
+
+        info!("Uploading to S3 {} ({}KB)", key, segment.data.len() / 1024);
+
+        let cache_control = if key.ends_with(".m3u8") {
+            "no-cache, no-store, must-revalidate"
+        } else {
+            "public, max-age=3600"  // 세그먼트는 1시간 캐시
+        };
+
+        let mut put_request = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .content_type(&segment.content_type)
+            .cache_control(cache_control);
+
+        if key.ends_with(".m3u8") {
+            put_request = put_request
+                .metadata("x-amz-meta-last-modified", &chrono::Utc::now().to_rfc3339())
+                .metadata("x-amz-meta-type", "playlist");
+        }
+
+        let result = put_request.send().await;
+
+        match result {
+            Ok(_) => {
+                info!("Upload successful: {}", key);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Upload error for {}: {:?}", key, e);
+                Err(Box::new(e))
+            }
+        }
+    }
+
+    /// 병렬 배치 업로드
+    pub async fn batch_upload(&self, segments: Vec<MemorySegment>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let upload_futures: Vec<_> = segments
+            .into_iter()
+            .map(|segment| self.queue_segment(segment))
+            .collect();
+
+        join_all(upload_futures).await;
+        Ok(())
+    }
+
+    /// 해당 스트림의 모든 세그먼트를 메모리에서 업로드
+    pub async fn upload_stream_from_memory(
+        &self,
+        stream_name: &str,
+        segments: HashMap<String, Vec<u8>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut upload_segments = Vec::new();
+
+        for (file_name, data) in segments {
+            let content_type = if file_name.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else if file_name.ends_with(".ts") {
+                "video/mp2t"
+            } else if file_name.ends_with(".m4s") {
+                "video/iso.segment"
+            } else if file_name.ends_with(".mp4") {
+                "video/mp4"
+            } else {
+                "application/octet-stream"
+            };
+
+            // 각 파일별 우선 순위를 지정합니다.
+            let priority = if file_name.ends_with(".m3u8") {
+                255 // 플레이리스트
+            } else if file_name.contains("init") {
+                200 // init.mp4
+            } else {
+                100 // 일반 세그먼트
+            };
+
+            upload_segments.push(MemorySegment {
+                stream_name: stream_name.to_string(),
+                file_name: file_name.clone(),
+                data,
+                content_type: content_type.to_string(),
+                priority,
+                created_at: Utc::now(),
+                retry_count: 0,
+            });
+        }
+
+        self.batch_upload(upload_segments).await
+    }
+
+    /// 업로드 상태 조회
+    pub async fn get_upload_status(&self, key: &str) -> Option<UploadState> {
+        let uploads = self.active_uploads.read().await;
+        uploads.get(key).cloned()
+    }
+
+    /// 대기 중인 업로드 수 조회
+    pub async fn pending_count(&self) -> usize {
+        let queue = self.upload_queue.read().await;
+        queue.len()
+    }
+
+    /// 활성 업로드 수 조회
+    pub async fn active_count(&self) -> usize {
+        let uploads = self.active_uploads.read().await;
+        uploads.values().filter(|s| matches!(s, UploadState::Uploading)).count()
+    }
+
+    /// 완료된 업로드 정리
+    pub async fn cleanup_completed(&self, older_than_secs: i64) {
+        let mut uploads = self.active_uploads.write().await;
+        let now = Utc::now();
+
+        uploads.retain(|_, state| {
+            !matches!(state, UploadState::Completed)
+        });
+    }
+
+
+    /// 업로더 종료
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(()).await;
+
+        // 모든 활성 업로드가 완료될 때까지 대기
+        while self.active_count().await > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+}
