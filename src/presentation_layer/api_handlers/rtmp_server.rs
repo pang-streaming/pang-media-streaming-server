@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use scuffle_rtmp::session::server::ServerSession;
+use log::{info, error};
 use crate::business_layer::streaming::hls_convertor::HlsConvertor;
 use super::rtmp_session_handler::RtmpSessionHandler;
 
@@ -18,10 +19,10 @@ impl RtmpServer {
     /// RTMP 서버 시작
     pub async fn start(&self, address: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(address).await?;
-        println!("📡 RTMP Server listening on {}", address);
-        
+        info!("RTMP Server listening on {}", address);
+
         while let Ok((stream, addr)) = listener.accept().await {
-            println!("📡 New RTMP connection from: {}", addr);
+            info!("New RTMP connection from: {}", addr);
             
             // 각 연결마다 새로운 핸들러 생성
             let handler = RtmpSessionHandler::new(self.hls_convertor.clone());
@@ -29,7 +30,7 @@ impl RtmpServer {
             
             tokio::spawn(async move {
                 if let Err(err) = session.run().await {
-                    eprintln!("❌ RTMP session error: {}", err);
+                    error!("RTMP session error: {}", err);
                 }
             });
         }

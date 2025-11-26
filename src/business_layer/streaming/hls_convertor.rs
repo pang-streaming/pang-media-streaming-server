@@ -1,26 +1,23 @@
 use std::sync::Arc;
 use crate::config::Config;
-use crate::business_layer::monitoring::{MetricsCollector, LatencyMonitor};
-use super::hls_conversion_manager::HlsConversionManager;
+use super::memory_hls_manager::MemoryHlsManager;
 
-/// HLS 변환기 (기존 호환성을 위한 래퍼)
+/// HLS 변환기 (메모리 기반 시스템 사용)
 pub struct HlsConvertor {
-    conversion_manager: Arc<HlsConversionManager>,
+    memory_manager: Arc<MemoryHlsManager>,
 }
 
 impl HlsConvertor {
     /// 새로운 HLS 변환기 생성
     pub async fn new(
         config: Config,
-        metrics_collector: Arc<MetricsCollector>,
-        latency_monitor: Arc<LatencyMonitor>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let conversion_manager = Arc::new(
-            HlsConversionManager::new(config, metrics_collector, latency_monitor).await?
+        let memory_manager = Arc::new(
+            MemoryHlsManager::new(config).await?
         );
 
         Ok(Self {
-            conversion_manager,
+            memory_manager,
         })
     }
 
@@ -30,7 +27,7 @@ impl HlsConvertor {
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conversion_manager.start_hls_conversion(stream_id, stream_name).await
+        self.memory_manager.start_hls_conversion(stream_id, stream_name).await
     }
 
     /// HLS 변환 중지
@@ -39,7 +36,7 @@ impl HlsConvertor {
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conversion_manager.stop_hls_conversion(stream_id, stream_name).await
+        self.memory_manager.stop_hls_conversion(stream_id, stream_name).await
     }
 
     /// 스트림 데이터 처리
@@ -48,22 +45,31 @@ impl HlsConvertor {
         stream_id: u32,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conversion_manager.process_stream_data(stream_id, data).await
+        self.memory_manager.process_stream_data(stream_id, data).await
     }
 
     /// 스트림을 S3에 업로드
     pub async fn upload_stream_to_s3(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conversion_manager.upload_stream_to_s3(stream_name).await
+        self.memory_manager.upload_stream_to_s3(stream_name).await
     }
 
     /// S3 업로드 상태 조회
     pub async fn get_s3_upload_status(&self, stream_name: &str) -> Option<crate::data_layer::storage::s3_types::UploadStatus> {
-        self.conversion_manager.get_s3_upload_status(stream_name).await
+        let status = self.memory_manager.get_s3_upload_status(stream_name).await;
+
+        // 새로운 형식을 기존 형식으로 변환
+        Some(crate::data_layer::storage::s3_types::UploadStatus {
+            stream_key: stream_name.to_string(),
+            total_files: status.pending_uploads + status.active_uploads,
+            uploaded_files: 0, // 정확한 값은 추적하지 않음
+            failed_files: 0,
+            is_complete: status.is_complete,
+        })
     }
 
     /// S3에서 스트림 삭제
     pub async fn delete_stream_from_s3(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conversion_manager.delete_stream_from_s3(stream_name).await
+        self.memory_manager.delete_stream_from_s3(stream_name).await
     }
 
     /// 특정 파일을 S3에 업로드
@@ -74,16 +80,16 @@ impl HlsConvertor {
     }
 
     /// 활성 스트림 수 조회
-    pub fn get_active_stream_count(&self) -> usize {
-        self.conversion_manager.get_active_stream_count()
+    pub async fn get_active_stream_count(&self) -> usize {
+        self.memory_manager.get_active_stream_count().await
     }
 
     /// 스트림 존재 여부 확인
-    pub fn has_stream(&self, stream_id: u32) -> bool {
-        self.conversion_manager.has_stream(stream_id)
+    pub async fn has_stream(&self, stream_id: u32) -> bool {
+        self.memory_manager.has_stream(stream_id).await
     }
 
     pub fn api_config(&self) -> &crate::config::ApiConfig {
-        &self.conversion_manager.api_config
+        &self.memory_manager.api_config
     }
 }
