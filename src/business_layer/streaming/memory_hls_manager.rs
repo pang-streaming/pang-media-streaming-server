@@ -131,9 +131,6 @@ impl MemoryHlsManager {
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // S3 정리는 하지 않음 (에포크 시간 기반 세그먼트 번호로 중복 없음)
-        // 필요시 수동으로 cleanup_s3_stream() 호출 가능
-
         // 메모리 버퍼에 스트림 생성
         self.buffer_manager.create_stream(stream_name.to_string()).await?;
 

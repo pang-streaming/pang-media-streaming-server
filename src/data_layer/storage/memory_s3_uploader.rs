@@ -284,17 +284,6 @@ impl MemoryS3Uploader {
         uploads.values().filter(|s| matches!(s, UploadState::Uploading)).count()
     }
 
-    /// 완료된 업로드 정리
-    pub async fn cleanup_completed(&self, older_than_secs: i64) {
-        let mut uploads = self.active_uploads.write().await;
-        let now = Utc::now();
-
-        uploads.retain(|_, state| {
-            !matches!(state, UploadState::Completed)
-        });
-    }
-
-
     /// 업로더 종료
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(()).await;

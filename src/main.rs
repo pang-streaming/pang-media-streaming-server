@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio;
-use log::{info, error};
+use log::info;
 
 mod config;
 mod presentation_layer;

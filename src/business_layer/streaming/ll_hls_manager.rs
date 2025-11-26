@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use chrono::Utc;
-use log::{info, warn, error};
+use log::{info, warn};
 
 use super::ll_hls_playlist::{
-    LLHlsPlaylistGenerator, LLHlsPart, LLHlsSegment, RenditionReport, SegmentInfo
+    LLHlsPlaylistGenerator, LLHlsPart, RenditionReport, SegmentInfo
 };
 use crate::data_layer::storage::memory_s3_uploader::{MemoryS3Uploader, MemorySegment};
 

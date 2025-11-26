@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 /// 스트림별 메모리 버퍼
 pub struct StreamBuffer {

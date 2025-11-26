@@ -60,7 +60,7 @@ impl MemoryFfmpegPipelineManager {
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
-        let mut stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+        let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
         // 파일 변경 감지 및 메모리로 이동
         let watcher_handle = start_file_watcher(

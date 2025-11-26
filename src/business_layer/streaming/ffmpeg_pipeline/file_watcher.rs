@@ -100,15 +100,11 @@ async fn process_file_ll_hls(
     let base_url = format!("https://{}.s3.ap-northeast-2.amazonaws.com/{}", s3_bucket, stream_name);
 
     if file_name.ends_with(".m3u8") {
-        // FFmpeg 플레이리스트는 세그먼트 처리 시 LL-HLS로 변환하므로 여기서는 메모리에만 저장
-        // S3 업로드는 세그먼트 처리 시에만 수행 (rate limit 방지)
         let modified_data = update_playlist_urls(&data, &base_url);
         let _ = buffer_manager.store_playlist(stream_name, modified_data).await;
 
     } else if file_name == "init.mp4" {
-        // 초기화 세그먼트 - 스펙에 맞게 1080p_0_0_0.m4s 형식으로 저장
-        let init_filename = "1080p_0_0_0.m4s".to_string();
-
+        let init_filename = "init.m4s".to_string();
         let mut state = ll_hls_state.write().await;
         state.generator.set_init_segment(init_filename.clone());
 
@@ -151,7 +147,7 @@ async fn process_file_ll_hls(
         // 세그먼트 이름에서 확장자 제거
         let segment_base = file_name.trim_end_matches(".m4v").trim_end_matches(".m4s").trim_end_matches(".ts");
 
-        // 파트 데이터 분할 (2등분)
+        // 파트를 2등분으로 분할 후 업로드
         let part_size = data.len() / num_parts;
         let mut part_filenames = Vec::new();
         let mut part_data_list = Vec::new();
@@ -240,91 +236,6 @@ async fn process_file_ll_hls(
             data,
             content_type: "image/jpeg".to_string(),
             priority: 150,
-            created_at: chrono::Utc::now(),
-            retry_count: 0,
-        };
-        let _ = s3_uploader.queue_segment(segment).await;
-    }
-}
-
-/// 파일 타입별 처리
-async fn process_file(
-    file_name: &str,
-    data: Vec<u8>,
-    stream_name: &str,
-    buffer_manager: &Arc<MemoryBufferManager>,
-    s3_uploader: &Arc<MemoryS3Uploader>,
-    s3_bucket: &str,
-) {
-    // 파일 타입에 따라 처리
-    if file_name.ends_with(".m3u8") {
-        // 플레이리스트의 URL을 S3 URL로 수정
-        let base_url = format!("https://{}.s3.ap-northeast-2.amazonaws.com/{}", s3_bucket, stream_name);
-        let modified_data = update_playlist_urls(&data, &base_url);
-
-        // 플레이리스트를 메모리 버퍼에 저장
-        let _ = buffer_manager.store_playlist(stream_name, modified_data.clone()).await;
-
-        // S3에 즉시 업로드 (플레이리스트는 최우선)
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: file_name.to_string(),
-            data: modified_data.clone(),
-            content_type: "application/vnd.apple.mpegurl".to_string(),
-            priority: 255,
-            created_at: chrono::Utc::now(),
-            retry_count: 0,
-        };
-        let _ = s3_uploader.queue_segment(segment).await;
-
-    } else if file_name == "init.mp4" {
-        // 초기화 세그먼트를 메모리 버퍼에 저장
-        let _ = buffer_manager.store_init_segment(stream_name, data.clone()).await;
-
-        // S3에 업로드
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: file_name.to_string(),
-            data,
-            content_type: "video/mp4".to_string(),
-            priority: 200,
-            created_at: chrono::Utc::now(),
-            retry_count: 0,
-        };
-        let _ = s3_uploader.queue_segment(segment).await;
-
-    } else if file_name.ends_with(".m4s") || file_name.ends_with(".ts") {
-        // 세그먼트를 메모리 버퍼에 저장
-        let _ = buffer_manager.store_segment(stream_name, file_name, data.clone()).await;
-
-        // S3에 업로드
-        let content_type = if file_name.ends_with(".m4s") {
-            "video/iso.segment"
-        } else {
-            "video/mp2t"
-        };
-
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: file_name.to_string(),
-            data,
-            content_type: content_type.to_string(),
-            priority: 100,
-            created_at: chrono::Utc::now(),
-            retry_count: 0,
-        };
-        let _ = s3_uploader.queue_segment(segment).await;
-
-    } else if file_name == "thumbnail.jpg" {
-        // 썸네일을 S3에 업로드
-        info!("Uploading thumbnail to S3...");
-
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: file_name.to_string(),
-            data,
-            content_type: "image/jpeg".to_string(),
-            priority: 150,  // 썸네일은 중간 우선순위
             created_at: chrono::Utc::now(),
             retry_count: 0,
         };
