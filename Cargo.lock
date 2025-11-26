@@ -1871,6 +1871,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "m3u8-rs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f03cd3335fb5f2447755d45cda9c70f76013626a9db44374973791b0926a86c3"
+dependencies = [
+ "chrono",
+ "nom",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2118,6 +2128,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.7.0",
  "log",
+ "m3u8-rs",
  "notify",
  "reqwest",
  "scuffle-rtmp",

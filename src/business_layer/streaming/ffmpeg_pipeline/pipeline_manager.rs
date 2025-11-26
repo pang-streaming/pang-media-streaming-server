@@ -91,9 +91,12 @@ impl MemoryFfmpegPipelineManager {
         Ok(())
     }
 
-    /// FFmpeg 명령어 구성
+    /// FFmpeg 파이프라인 빌드
     fn build_ffmpeg_command(&self, stream_name: &str, temp_dir: &str) -> Command {
-        let segment_filename_pattern = format!("{}/segment_%d.m4s", temp_dir);
+        let segment_filename_pattern = format!(
+            "{}/segment_%d.m4s",
+            temp_dir
+        );
         let playlist_path = format!("{}/playlist.m3u8", temp_dir);
         let mut cmd = Command::new("ffmpeg");
 
@@ -121,9 +124,9 @@ impl MemoryFfmpegPipelineManager {
             "-map", "0:a:0",
 
             "-f", "hls",
-            "-hls_time", "1",
+            "-hls_time", "2",
             "-hls_list_size", "10",
-            "-hls_flags", "temp_file+independent_segments",
+            "-hls_flags", "independent_segments+program_date_time+temp_file",
 
             "-hls_segment_type", "fmp4",
             "-hls_fmp4_init_filename", "init.mp4",
@@ -132,15 +135,8 @@ impl MemoryFfmpegPipelineManager {
             "-hls_playlist_type", "event",
             "-hls_allow_cache", "0",
             "-hls_start_number_source", "datetime",
-            "-movflags", "+frag_keyframe+empty_moov+faststart",
+            "-movflags", "+frag_keyframe+empty_moov+faststart+default_base_moof",
             &playlist_path,
-
-            "-map", "0:v:0",
-            "-vf", "fps=1/10,scale=640:-1",
-            "-q:v", "2",
-            "-update", "1",
-            "-f", "image2",
-            &format!("{}/thumbnail.jpg", temp_dir),
         ]);
 
         cmd

@@ -28,7 +28,8 @@ impl MemoryHlsManager {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // S3 클라이언트 생성 (config.toml의 자격 증명 사용)
         use aws_credential_types::Credentials;
-        use aws_sdk_s3::config::{BehaviorVersion, Region};
+        use aws_sdk_s3::config::{BehaviorVersion, Region, timeout::TimeoutConfig};
+        use std::time::Duration;
 
         let credentials = Credentials::new(
             &config.s3.access_key,
@@ -38,10 +39,19 @@ impl MemoryHlsManager {
             "static",
         );
 
+        // 타임아웃 설정 (RequestTimeout 방지)
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .operation_timeout(Duration::from_secs(60))
+            .operation_attempt_timeout(Duration::from_secs(30))
+            .build();
+
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.s3.region.clone()))
             .credentials_provider(credentials)
+            .timeout_config(timeout_config)
             .build();
 
         let s3_client = Arc::new(S3Client::from_conf(s3_config));

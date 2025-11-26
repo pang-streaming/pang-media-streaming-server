@@ -74,6 +74,15 @@ impl MemoryS3Uploader {
 
         // 우선순위에 따라 큐에 삽입
         let insert_pos = queue.iter().position(|s| s.priority < segment.priority).unwrap_or(queue.len());
+
+        info!("[S3 Queue] {} ({}KB, priority={}, queue_pos={}/{})",
+            segment.file_name,
+            segment.data.len() / 1024,
+            segment.priority,
+            insert_pos,
+            queue.len()
+        );
+
         queue.insert(insert_pos, segment.clone());
 
         // 바로 업로드 작업 시작
@@ -102,12 +111,16 @@ impl MemoryS3Uploader {
             }?;
 
             let key = format!("{}/{}", segment.stream_name, segment.file_name);
+            let file_size_kb = segment.data.len() / 1024;
 
             // 업로드 상태 업데이트
             {
                 let mut uploads = active_uploads.write().await;
                 uploads.insert(key.clone(), UploadState::Uploading);
             }
+
+            info!("[S3 Start] {} ({}KB)", key, file_size_kb);
+            let upload_start = std::time::Instant::now();
 
             // 재시도 로직 포함 업로드
             let mut retry_count = 0;
@@ -117,38 +130,50 @@ impl MemoryS3Uploader {
                 match Self::upload_to_s3(&client, &bucket, &key, &segment).await {
                     Ok(_) => {
                         // 성공
+                        let elapsed = upload_start.elapsed();
                         let mut uploads = active_uploads.write().await;
                         uploads.insert(key.clone(), UploadState::Completed);
 
-                        info!("S3 Upload Success: {}", key);
+                        info!("[S3 Done] {} ({}KB) in {:?}", key, file_size_kb, elapsed);
+
+                        // 업로드 후 rate limiting (50ms 딜레이)
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         return Some(());
                     }
                     Err(e) => {
                         retry_count += 1;
-                        last_error = Some(format!("{:?}", e)); // 더 자세한 에러 정보
+                        let error_str = format!("{:?}", e);
+                        last_error = Some(error_str.clone());
 
                         if retry_count <= max_retries {
-                            warn!("S3 Upload Failed (retry {}/{}): {}",
-                                retry_count, max_retries, key);
-                            error!("Error details: {:?}", e);
+                            // 에러 유형별 백오프 설정
+                            let (error_type, backoff_secs) = if error_str.contains("SlowDown") {
+                                ("SlowDown", 5u64.pow(retry_count as u32))
+                            } else if error_str.contains("RequestTimeout") {
+                                ("RequestTimeout", 1)
+                            } else if error_str.contains("dispatch failure") || error_str.contains("connection") {
+                                ("Network", 2u64.pow(retry_count as u32))
+                            } else {
+                                ("Unknown", 2u64.pow(retry_count as u32 - 1))
+                            };
 
-                            // dispatch failure는 보통 네트워크 또는 자격 증명 문제
-                            if e.to_string().contains("dispatch failure") {
-                                info!("Possible causes: Network issue, invalid credentials, or wrong region");
-                            }
+                            warn!("[S3 Retry] {} (retry {}/{}, {}, wait {}s)",
+                                key, retry_count, max_retries, error_type, backoff_secs);
 
-                            // 지수 백오프
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(retry_count as u32 - 1))).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
                         }
                     }
                 }
             }
 
             // 최종 실패
+            let elapsed = upload_start.elapsed();
             let mut uploads = active_uploads.write().await;
-            uploads.insert(key.clone(), UploadState::Failed(last_error.unwrap_or_else(|| "Unknown error".to_string())));
+            uploads.insert(key.clone(), UploadState::Failed(last_error.clone().unwrap_or_else(|| "Unknown error".to_string())));
 
-            error!("S3 Upload Failed after {} retries: {}", max_retries, key);
+            error!("[S3 Failed] {} after {} retries in {:?}: {}",
+                key, max_retries, elapsed,
+                last_error.unwrap_or_else(|| "Unknown".to_string()).chars().take(100).collect::<String>());
             None
         });
     }
@@ -161,8 +186,6 @@ impl MemoryS3Uploader {
         segment: &MemorySegment,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let body = ByteStream::from(segment.data.clone());
-
-        info!("Uploading to S3 {} ({}KB)", key, segment.data.len() / 1024);
 
         let cache_control = if key.ends_with(".m3u8") {
             "no-cache, no-store, must-revalidate"
@@ -184,18 +207,8 @@ impl MemoryS3Uploader {
                 .metadata("x-amz-meta-type", "playlist");
         }
 
-        let result = put_request.send().await;
-
-        match result {
-            Ok(_) => {
-                info!("Upload successful: {}", key);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Upload error for {}: {:?}", key, e);
-                Err(Box::new(e))
-            }
-        }
+        put_request.send().await?;
+        Ok(())
     }
 
     /// 병렬 배치 업로드
