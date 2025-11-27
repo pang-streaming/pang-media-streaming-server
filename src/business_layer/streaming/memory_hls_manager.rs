@@ -1,19 +1,23 @@
-use std::sync::Arc;
 use std::collections::HashMap;
-use log::{info, warn, error};
+use std::sync::Arc;
+
+use chrono::Utc;
+use log::{error, info, warn};
+
 use crate::config::{ApiConfig, Config};
 use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
 use crate::data_layer::storage::memory_s3_uploader::{MemoryS3Uploader, MemorySegment};
 use super::ffmpeg_pipeline::MemoryFfmpegPipelineManager;
-use super::master_playlist_generator::{MasterPlaylistGenerator, StreamMetadata, ReplayManager};
+use super::master_playlist_generator::{MasterPlaylistGenerator, ReplayManager, StreamMetadata};
+
 use aws_sdk_s3::Client as S3Client;
-use chrono::Utc;
 
 /// 메모리 기반 HLS 변환 관리자
 pub struct MemoryHlsManager {
     ffmpeg_manager: Arc<MemoryFfmpegPipelineManager>,
     buffer_manager: Arc<MemoryBufferManager>,
     s3_uploader: Arc<MemoryS3Uploader>,
+    s3_client: Arc<S3Client>, 
     master_generator: Arc<MasterPlaylistGenerator>,
     replay_manager: Arc<tokio::sync::RwLock<ReplayManager>>,
     stream_metadata: Arc<tokio::sync::RwLock<HashMap<String, StreamMetadata>>>,
@@ -26,9 +30,12 @@ impl MemoryHlsManager {
     pub async fn new(
         config: Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // S3 클라이언트 생성 (config.toml의 자격 증명 사용)
+        // S3 클라이언트 생성 (최적화된 설정)
         use aws_credential_types::Credentials;
-        use aws_sdk_s3::config::{BehaviorVersion, Region, timeout::TimeoutConfig};
+        use aws_sdk_s3::config::{
+            timeout::TimeoutConfig, BehaviorVersion, Region, StalledStreamProtectionConfig,
+            retry::RetryConfig,
+        };
         use std::time::Duration;
 
         let credentials = Credentials::new(
@@ -39,26 +46,45 @@ impl MemoryHlsManager {
             "static",
         );
 
-        // 타임아웃 설정 (RequestTimeout 방지)
+        // 타임아웃 설정 (EC2/로컬 환경 모두 대응)
         let timeout_config = TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .operation_timeout(Duration::from_secs(60))
-            .operation_attempt_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15))      // 연결 타임아웃
+            .read_timeout(Duration::from_secs(60))         // 읽기 타임아웃
+            .operation_timeout(Duration::from_secs(120))   // 전체 작업 타임아웃
+            .operation_attempt_timeout(Duration::from_secs(60))  // 시도당 타임아웃
             .build();
+
+        // 재시도 설정 (연결 끊김 대응 - 적극적 재시도)
+        let retry_config = RetryConfig::standard()
+            .with_max_attempts(10)                         // 최대 10회 재시도 (연결 문제 대응)
+            .with_initial_backoff(Duration::from_millis(50))   // 초기 백오프 50ms
+            .with_max_backoff(Duration::from_secs(3))      // 최대 백오프 3초
+            .with_reconnect_mode(aws_sdk_s3::config::retry::ReconnectMode::ReconnectOnTransientError);
+
+        // 느린 업로드로 인한 강제 종료 방지
+        let stalled_stream_config = StalledStreamProtectionConfig::disabled();
 
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.s3.region.clone()))
             .credentials_provider(credentials)
             .timeout_config(timeout_config)
+            .retry_config(retry_config)
+            .stalled_stream_protection(stalled_stream_config)
+            .force_path_style(false)  // 가상 호스트 스타일 (S3 기본)
             .build();
 
         let s3_client = Arc::new(S3Client::from_conf(s3_config));
 
+        info!("S3 client initialized with optimized settings:");
+        info!("   - Max retry attempts: 5");
+        info!("   - Stalled stream protection: disabled");
+        info!("   - Operation timeout: 120s");
+
         // S3 연결 테스트
         info!("Testing S3 connection to bucket: {}", config.s3.bucket);
-        match s3_client.list_objects_v2()
+        match s3_client
+            .list_objects_v2()
             .bucket(&config.s3.bucket)
             .max_keys(1)
             .send()
@@ -67,11 +93,16 @@ impl MemoryHlsManager {
             Ok(_) => info!("S3 connection successful!"),
             Err(e) => {
                 error!("S3 connection failed: {:?}", e);
-                error!("   Please check:");
                 error!("   - Bucket name: {}", config.s3.bucket);
                 error!("   - Region: {}", config.s3.region);
-                error!("   - Access key is configured: {}", !config.s3.access_key.is_empty());
-                error!("   - Secret key is configured: {}", !config.s3.secret_access_key.is_empty());
+                error!(
+                    "   - Access key is configured: {}",
+                    !config.s3.access_key.is_empty()
+                );
+                error!(
+                    "   - Secret key is configured: {}",
+                    !config.s3.secret_access_key.is_empty()
+                );
             }
         }
 
@@ -87,20 +118,21 @@ impl MemoryHlsManager {
                 s3_client.clone(),
                 config.s3.bucket.clone(),
                 config.streaming.upload_workers,
-            ).await?
+            )
+                .await?,
         );
 
         // 메모리 FFmpeg 파이프라인 관리자 생성
-        let ffmpeg_manager = Arc::new(
-            MemoryFfmpegPipelineManager::new(
+        let ffmpeg_manager =
+            Arc::new(MemoryFfmpegPipelineManager::new(
                 config.clone(),
                 buffer_manager.clone(),
                 s3_uploader.clone(),
-            )
-        );
+            ));
 
         // 마스터 플레이리스트 생성기
-        let bucket_url = format!("https://{}.s3.ap-northeast-2.amazonaws.com", config.s3.bucket);
+        let bucket_url =
+            format!("https://{}.s3.ap-northeast-2.amazonaws.com", config.s3.bucket);
         let master_generator = Arc::new(MasterPlaylistGenerator::new(bucket_url));
 
         // 리플레이 매니저
@@ -108,15 +140,25 @@ impl MemoryHlsManager {
         let stream_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         info!("Memory-based HLS Manager initialized");
-        info!("   - Max buffer size: {}MB", config.streaming.memory_buffer_mb);
-        info!("   - Max segments per stream: {}", config.streaming.max_segments_per_stream);
-        info!("   - S3 upload workers: {}", config.streaming.upload_workers);
+        info!(
+            "   - Max buffer size: {}MB",
+            config.streaming.memory_buffer_mb
+        );
+        info!(
+            "   - Max segments per stream: {}",
+            config.streaming.max_segments_per_stream
+        );
+        info!(
+            "   - S3 upload workers: {}",
+            config.streaming.upload_workers
+        );
         info!("   - Bucket: {}", config.s3.bucket);
 
         Ok(Self {
             ffmpeg_manager,
             buffer_manager,
             s3_uploader,
+            s3_client,
             master_generator,
             replay_manager,
             stream_metadata,
@@ -132,27 +174,37 @@ impl MemoryHlsManager {
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 메모리 버퍼에 스트림 생성
-        self.buffer_manager.create_stream(stream_name.to_string()).await?;
+        self.buffer_manager
+            .create_stream(stream_name.to_string())
+            .await?;
 
         // FFmpeg 파이프라인 시작 (자동으로 메모리에 쓰고 S3에 업로드)
-        self.ffmpeg_manager.start_pipeline(stream_id, stream_name).await?;
+        self.ffmpeg_manager
+            .start_pipeline(stream_id, stream_name)
+            .await?;
 
         // 스트림 메타데이터 저장
         {
             let mut metadata_map = self.stream_metadata.write().await;
-            metadata_map.insert(stream_name.to_string(), StreamMetadata {
-                stream_name: stream_name.to_string(),
-                start_time: Utc::now(),
-                end_time: None,
-                is_live: true,
-                bitrate: 5000000,
-                resolution: "1920x1080".to_string(),
-                codecs: "avc1.640028,mp4a.40.2".to_string(),
-                frame_rate: 60.0,
-            });
+            metadata_map.insert(
+                stream_name.to_string(),
+                StreamMetadata {
+                    stream_name: stream_name.to_string(),
+                    start_time: Utc::now(),
+                    end_time: None,
+                    is_live: true,
+                    bitrate: 5_000_000,
+                    resolution: "1920x1080".to_string(),
+                    codecs: "avc1.640028,mp4a.40.2".to_string(),
+                    frame_rate: 60.0,
+                },
+            );
         }
 
-        info!("Memory-based HLS conversion started for stream {} ({})", stream_id, stream_name);
+        info!(
+            "Memory-based HLS conversion started for stream {} ({})",
+            stream_id, stream_name
+        );
         info!("Segments use epoch-based numbering (no conflicts)");
         Ok(())
     }
@@ -168,7 +220,9 @@ impl MemoryHlsManager {
 
         // 남은 세그먼트 모두 업로드
         if let Some(data) = self.buffer_manager.get_stream_data(stream_name).await {
-            self.s3_uploader.upload_stream_from_memory(stream_name, data).await?;
+            self.s3_uploader
+                .upload_stream_from_memory(stream_name, data)
+                .await?;
         }
 
         // VOD 플레이리스트 생성 및 업로드
@@ -192,7 +246,10 @@ impl MemoryHlsManager {
         // 메모리 버퍼 정리 (리플레이를 위해 S3에는 유지)
         self.buffer_manager.remove_stream(stream_name).await?;
 
-        info!("Memory-based HLS conversion stopped for stream {} ({})", stream_id, stream_name);
+        info!(
+            "Memory-based HLS conversion stopped for stream {} ({})",
+            stream_id, stream_name
+        );
         info!("Stream is now available for replay");
         Ok(())
     }
@@ -207,9 +264,14 @@ impl MemoryHlsManager {
     }
 
     /// 스트림을 S3에 업로드 (이미 자동으로 업로드되지만 수동 트리거용)
-    pub async fn upload_stream_to_s3(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn upload_stream_to_s3(
+        &self,
+        stream_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(data) = self.buffer_manager.get_stream_data(stream_name).await {
-            self.s3_uploader.upload_stream_from_memory(stream_name, data).await?;
+            self.s3_uploader
+                .upload_stream_from_memory(stream_name, data)
+                .await?;
             info!("Manual upload triggered for stream: {}", stream_name);
         } else {
             warn!("No data found for stream: {}", stream_name);
@@ -230,9 +292,11 @@ impl MemoryHlsManager {
         }
     }
 
-    /// S3에서 스트림 삭제
-    pub async fn delete_stream_from_s3(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // S3 삭제 로직 구현 필요
+    /// S3에서 스트림 삭제 (미구현)
+    pub async fn delete_stream_from_s3(
+        &self,
+        stream_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("S3 deletion not implemented yet for: {}", stream_name);
         Ok(())
     }
@@ -284,20 +348,27 @@ impl MemoryHlsManager {
     }
 
     /// Master 플레이리스트 생성 (VOD 전용)
-    async fn generate_master_playlist(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let base_url = format!("https://{}.s3.ap-northeast-2.amazonaws.com/{}",
-            self.config.s3.bucket, stream_name);
+    async fn generate_master_playlist(
+        &self,
+        stream_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let base_url = format!(
+            "https://{}.s3.ap-northeast-2.amazonaws.com/{}",
+            self.config.s3.bucket, stream_name
+        );
 
         let mut playlist = String::new();
 
-        // HLS 버전
+        // HLS 헤더
         playlist.push_str("#EXTM3U\n");
         playlist.push_str("#EXT-X-VERSION:7\n");
         playlist.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n\n");
 
         // VOD 스트림 정보
         playlist.push_str("# VOD Replay Stream\n");
-        playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,FRAME-RATE=60.00,CODECS=\"avc1.640028,mp4a.40.2\",NAME=\"1080p60-VOD\"\n");
+        playlist.push_str(
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,FRAME-RATE=60.00,CODECS=\"avc1.640028,mp4a.40.2\",NAME=\"1080p60-VOD\"\n",
+        );
         playlist.push_str(&format!("{}/vod_playlist.m3u8\n", base_url));
 
         // Master 플레이리스트 업로드
@@ -317,25 +388,11 @@ impl MemoryHlsManager {
     }
 
     /// VOD 플레이리스트 생성 (모든 세그먼트 포함)
-    async fn generate_vod_playlist(&self, stream_name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use aws_sdk_s3::config::{BehaviorVersion, Region};
-        use aws_credential_types::Credentials;
-
-        let credentials = Credentials::new(
-            &self.config.s3.access_key,
-            &self.config.s3.secret_access_key,
-            None,
-            None,
-            "static",
-        );
-
-        let s3_config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(self.config.s3.region.clone()))
-            .credentials_provider(credentials)
-            .build();
-
-        let client = S3Client::from_conf(s3_config);
+    async fn generate_vod_playlist(
+        &self,
+        stream_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.s3_client.clone();
 
         // S3에서 모든 세그먼트 파일 목록 가져오기
         let prefix = format!("{}/", stream_name);
@@ -360,7 +417,9 @@ impl MemoryHlsManager {
 
                             if file_name == "init.mp4" {
                                 init_segment = Some(file_name.to_string());
-                            } else if file_name.starts_with("segment_") && file_name.ends_with(".m4s") {
+                            } else if file_name.starts_with("segment_")
+                                && file_name.ends_with(".m4s")
+                            {
                                 segments.push(file_name.to_string());
                             }
                         }
@@ -375,7 +434,10 @@ impl MemoryHlsManager {
                     // HLS 헤더
                     vod_content.push_str("#EXTM3U\n");
                     vod_content.push_str("#EXT-X-VERSION:7\n");
-                    vod_content.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration.ceil() as i32));
+                    vod_content.push_str(&format!(
+                        "#EXT-X-TARGETDURATION:{}\n",
+                        target_duration.ceil() as i32
+                    ));
                     vod_content.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
                     vod_content.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
@@ -387,8 +449,10 @@ impl MemoryHlsManager {
                     vod_content.push_str("\n");
 
                     // 모든 세그먼트 추가
-                    let base_url = format!("https://{}.s3.ap-northeast-2.amazonaws.com/{}",
-                        self.config.s3.bucket, stream_name);
+                    let base_url = format!(
+                        "https://{}.s3.ap-northeast-2.amazonaws.com/{}",
+                        self.config.s3.bucket, stream_name
+                    );
 
                     for segment in segments {
                         vod_content.push_str(&format!("#EXTINF:{:.6},\n", target_duration));
@@ -410,7 +474,10 @@ impl MemoryHlsManager {
                     };
                     self.s3_uploader.queue_segment(segment).await;
 
-                    info!("VOD playlist generated with all segments for stream: {}", stream_name);
+                    info!(
+                        "VOD playlist generated with all segments for stream: {}",
+                        stream_name
+                    );
                 }
             }
             Err(e) => {
@@ -424,24 +491,7 @@ impl MemoryHlsManager {
     /// S3에서 기존 스트림 파일 정리 (선택적 - 수동 호출용)
     #[allow(dead_code)]
     pub async fn cleanup_s3_stream(&self, stream_name: &str) {
-        use aws_sdk_s3::config::{BehaviorVersion, Region};
-        use aws_credential_types::Credentials;
-
-        let credentials = Credentials::new(
-            &self.config.s3.access_key,
-            &self.config.s3.secret_access_key,
-            None,
-            None,
-            "static",
-        );
-
-        let s3_config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(self.config.s3.region.clone()))
-            .credentials_provider(credentials)
-            .build();
-
-        let client = S3Client::from_conf(s3_config);
+        let client = self.s3_client.clone();
 
         // 스트림 디렉토리의 모든 객체 나열
         let prefix = format!("{}/", stream_name);

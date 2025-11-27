@@ -22,5 +22,8 @@ EXPOSE 1935
 # HLS 출력 디렉토리 생성
 RUN mkdir -p /app/hls_output
 
+# Rust 로그 환경 변수 설정
+ENV RUST_LOG=debug
+
 # 애플리케이션 실행
 CMD ["./target/release/pang-streaming-server"]

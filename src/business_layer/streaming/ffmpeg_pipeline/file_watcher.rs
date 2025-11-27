@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::fs;
-use log::{info, error};
+use log::{info, warn, error, debug};
 use notify::{Watcher, RecursiveMode, Event, EventKind};
 use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
 use crate::data_layer::storage::memory_s3_uploader::{MemoryS3Uploader, MemorySegment};
@@ -20,8 +20,11 @@ pub async fn start_file_watcher(
     s3_uploader: Arc<MemoryS3Uploader>,
     s3_bucket: String,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error + Send + Sync>> {
+    info!("[FileWatcher] Initializing for stream: {} dir: {}", stream_name, watch_dir);
+
     let handle = tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel(100);
+        info!("[FileWatcher] Task started for: {}", stream_name);
 
         // LL-HLS 상태 초기화
         let ll_hls_state = Arc::new(RwLock::new(LLHlsState {
@@ -51,9 +54,10 @@ pub async fn start_file_watcher(
 
         // 디렉토리 감시 시작
         if let Err(e) = watcher.watch(std::path::Path::new(&watch_dir), RecursiveMode::NonRecursive) {
-            error!("Failed to watch directory: {}", e);
+            error!("[FileWatcher] Failed to watch directory: {}", e);
             return;
         }
+        info!("[FileWatcher] Watching directory: {}", watch_dir);
 
         // 이벤트 처리
         while let Some(event) = rx.recv().await {
@@ -61,9 +65,11 @@ pub async fn start_file_watcher(
                 for path in event.paths {
                     if let Some(file_name) = path.file_name() {
                         let file_name_str = file_name.to_string_lossy().to_string();
+                        debug!("[FileWatcher] File event: {}", file_name_str);
 
                         // 파일을 메모리로 읽기
                         if let Ok(data) = fs::read(&path).await {
+                            info!("[FileWatcher] Processing file: {} ({}KB)", file_name_str, data.len() / 1024);
                             process_file_ll_hls(
                                 &file_name_str,
                                 data,
@@ -124,6 +130,7 @@ async fn process_file_ll_hls(
     } else if file_name.ends_with(".m4v") || file_name.ends_with(".m4s") || file_name.ends_with(".ts") {
         // 세그먼트 파일 처리
         let file_size = data.len();
+        info!("[Segment] {} ({}KB) - processing", file_name, file_size / 1024);
         let _ = buffer_manager.store_segment(stream_name, file_name, data.clone()).await;
 
         // LL-HLS 상태 업데이트
@@ -188,43 +195,52 @@ async fn process_file_ll_hls(
         let ll_hls_playlist = state.generator.generate_media_playlist(None);
         drop(state);
 
-        // 파트 세그먼트 업로드
+        // 1. 파트 세그먼트 업로드 (최고 우선순위)
         for (part_filename, part_data) in part_filenames.iter().zip(part_data_list.iter()) {
+            debug!("[S3 Queue] part: {} ({}KB)", part_filename, part_data.len() / 1024);
             let part_segment = MemorySegment {
                 stream_name: stream_name.to_string(),
                 file_name: part_filename.clone(),
                 data: part_data.clone(),
                 content_type: "video/iso.segment".to_string(),
-                priority: 150,  // 파트는 전체 세그먼트보다 높은 우선순위
+                priority: 255,  // 파트 세그먼트 최우선
                 created_at: chrono::Utc::now(),
                 retry_count: 0,
             };
-            let _ = s3_uploader.queue_segment(part_segment).await;
+            if let Err(e) = s3_uploader.queue_segment(part_segment).await {
+                error!("[S3 Error] Failed to queue part {}: {:?}", part_filename, e);
+            }
         }
 
-        // S3에 LL-HLS 플레이리스트 업로드
+        // 2. 전체 세그먼트 파일 업로드 (높은 우선순위)
+        info!("[S3 Queue] segment: {} ({}KB)", full_segment_filename, data.len() / 1024);
+        let segment = MemorySegment {
+            stream_name: stream_name.to_string(),
+            file_name: full_segment_filename.clone(),
+            data,
+            content_type: "video/iso.segment".to_string(),
+            priority: 200,  // 전체 세그먼트 두번째
+            created_at: chrono::Utc::now(),
+            retry_count: 0,
+        };
+        if let Err(e) = s3_uploader.queue_segment(segment).await {
+            error!("[S3 Error] Failed to queue segment {}: {:?}", full_segment_filename, e);
+        }
+
+        // 3. 플레이리스트 업로드 (세그먼트 업로드 후 - 낮은 우선순위)
+        debug!("[S3 Queue] playlist: chunklist.m3u8 (after segments)");
         let playlist_segment = MemorySegment {
             stream_name: stream_name.to_string(),
             file_name: "chunklist.m3u8".to_string(),
             data: ll_hls_playlist.into_bytes(),
             content_type: "application/vnd.apple.mpegurl".to_string(),
-            priority: 255,
+            priority: 50,   // 플레이리스트는 세그먼트 후에
             created_at: chrono::Utc::now(),
             retry_count: 0,
         };
-        let _ = s3_uploader.queue_segment(playlist_segment).await;
-
-        // 전체 세그먼트 파일 S3 업로드
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: full_segment_filename,
-            data,
-            content_type: "video/iso.segment".to_string(),
-            priority: 100,
-            created_at: chrono::Utc::now(),
-            retry_count: 0,
-        };
-        let _ = s3_uploader.queue_segment(segment).await;
+        if let Err(e) = s3_uploader.queue_segment(playlist_segment).await {
+            error!("[S3 Error] Failed to queue playlist: {:?}", e);
+        }
 
     } else if file_name == "thumbnail.jpg" {
         // 썸네일 업로드

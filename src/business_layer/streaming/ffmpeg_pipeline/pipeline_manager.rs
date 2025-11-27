@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::io::Write;
 use tokio::fs;
-use log::{info, error};
+use log::{info, warn, error, debug};
 use crate::config::Config;
 use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
 use crate::data_layer::storage::memory_s3_uploader::MemoryS3Uploader;
@@ -40,12 +40,15 @@ impl MemoryFfmpegPipelineManager {
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("[Pipeline] Starting for stream {} (id={})", stream_name, stream_id);
+
         // 임시 출력 디렉토리 (FFmpeg는 파일 출력이 필요하지만, 즉시 메모리로 이동)
         let temp_dir = format!("/tmp/hls_temp/{}", stream_name);
 
         // 기존 디렉토리가 있으면 삭제 (클린 스타트)
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         tokio::fs::create_dir_all(&temp_dir).await?;
+        info!("[Pipeline] Temp directory created: {}", temp_dir);
 
         // 메모리 버퍼에 스트림 생성 (기존 것 제거 후 새로 생성)
         self.buffer_manager.remove_stream(stream_name).await?;
@@ -58,11 +61,14 @@ impl MemoryFfmpegPipelineManager {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
+        info!("[Pipeline] Spawning FFmpeg process...");
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
         let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+        info!("[Pipeline] FFmpeg process started");
 
         // 파일 변경 감지 및 메모리로 이동
+        info!("[Pipeline] Starting file watcher for: {}", temp_dir);
         let watcher_handle = start_file_watcher(
             stream_name.to_string(),
             temp_dir.clone(),
@@ -70,6 +76,7 @@ impl MemoryFfmpegPipelineManager {
             Arc::clone(&self.s3_uploader),
             self.config.s3.bucket.clone(),
         ).await?;
+        info!("[Pipeline] File watcher started");
 
         let pipeline = MemoryFfmpegPipeline {
             stdin,
