@@ -27,7 +27,7 @@ impl RtmpServer {
             // 각 연결마다 새로운 핸들러 생성
             let handler = RtmpSessionHandler::new(self.hls_convertor.clone());
             let session = ServerSession::new(stream, handler);
-            
+
             tokio::spawn(async move {
                 if let Err(err) = session.run().await {
                     error!("RTMP session error: {}", err);

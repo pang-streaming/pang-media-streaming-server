@@ -4,37 +4,33 @@ use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::io::Write;
 use tokio::fs;
-use log::{info, warn, error, debug};
+use log::{info, error};
 use crate::config::Config;
-use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
-use crate::data_layer::storage::memory_s3_uploader::MemoryS3Uploader;
+use crate::data_layer::storage::cli_s3_uploader::CliS3Uploader;
 use super::pipeline::MemoryFfmpegPipeline;
 use super::file_watcher::start_file_watcher;
 
-/// 메모리 기반 FFmpeg 파이프라인 관리자
+/// 파일 기반 FFmpeg 파이프라인 관리자
 pub struct MemoryFfmpegPipelineManager {
     pipelines: Arc<RwLock<HashMap<u32, MemoryFfmpegPipeline>>>,
     config: Config,
-    buffer_manager: Arc<MemoryBufferManager>,
-    s3_uploader: Arc<MemoryS3Uploader>,
+    s3_uploader: Arc<CliS3Uploader>,
 }
 
 impl MemoryFfmpegPipelineManager {
-    /// 새로운 메모리 기반 FFmpeg 파이프라인 관리자 생성
+    /// 새로운 파일 기반 FFmpeg 파이프라인 관리자 생성
     pub fn new(
         config: Config,
-        buffer_manager: Arc<MemoryBufferManager>,
-        s3_uploader: Arc<MemoryS3Uploader>,
+        s3_uploader: Arc<CliS3Uploader>,
     ) -> Self {
         Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             config,
-            buffer_manager,
             s3_uploader,
         }
     }
 
-    /// FFmpeg 파이프라인 시작 (메모리 버퍼 직접 연결)
+    /// FFmpeg 파이프라인 시작
     pub async fn start_pipeline(
         &self,
         stream_id: u32,
@@ -42,17 +38,13 @@ impl MemoryFfmpegPipelineManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("[Pipeline] Starting for stream {} (id={})", stream_name, stream_id);
 
-        // 임시 출력 디렉토리 (FFmpeg는 파일 출력이 필요하지만, 즉시 메모리로 이동)
+        // 출력 디렉토리
         let temp_dir = format!("/tmp/hls_temp/{}", stream_name);
 
         // 기존 디렉토리가 있으면 삭제 (클린 스타트)
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         tokio::fs::create_dir_all(&temp_dir).await?;
-        info!("[Pipeline] Temp directory created: {}", temp_dir);
-
-        // 메모리 버퍼에 스트림 생성 (기존 것 제거 후 새로 생성)
-        self.buffer_manager.remove_stream(stream_name).await?;
-        self.buffer_manager.create_stream(stream_name.to_string()).await?;
+        info!("[Pipeline] Output directory created: {}", temp_dir);
 
         // FFmpeg 명령어 구성
         let mut cmd = self.build_ffmpeg_command(stream_name, &temp_dir);
@@ -67,12 +59,11 @@ impl MemoryFfmpegPipelineManager {
         let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
         info!("[Pipeline] FFmpeg process started");
 
-        // 파일 변경 감지 및 메모리로 이동
+        // 파일 변경 감지 및 S3 업로드
         info!("[Pipeline] Starting file watcher for: {}", temp_dir);
         let watcher_handle = start_file_watcher(
             stream_name.to_string(),
             temp_dir.clone(),
-            Arc::clone(&self.buffer_manager),
             Arc::clone(&self.s3_uploader),
             self.config.s3.bucket.clone(),
         ).await?;
@@ -98,8 +89,8 @@ impl MemoryFfmpegPipelineManager {
         Ok(())
     }
 
-    /// FFmpeg 파이프라인 빌드
-    fn build_ffmpeg_command(&self, stream_name: &str, temp_dir: &str) -> Command {
+    /// FFmpeg 파이프라인 빌드 (LL-HLS 파트 직접 생성)
+    fn build_ffmpeg_command(&self, _stream_name: &str, temp_dir: &str) -> Command {
         let segment_filename_pattern = format!(
             "{}/segment_%d.m4s",
             temp_dir
@@ -110,18 +101,22 @@ impl MemoryFfmpegPipelineManager {
         cmd.args([
             "-y",
             "-i", "pipe:0",
+
+            // 비디오 코덱 설정
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
-
             "-b:v", "5000k",
             "-maxrate", "5000k",
             "-bufsize", "10000k",
 
+            // 프레임 설정 (2초마다 키프레임)
             "-r", "60",
-            "-g", "60",
-            "-keyint_min", "60",
+            "-g", "69",              // 2초마다 GOP (60fps * 2초)
+            "-keyint_min", "60",      // 최소 1초
             "-sc_threshold", "0",
+
+            // 오디오 설정
             "-c:a", "aac",
             "-b:a", "160k",
             "-ar", "44100",
@@ -130,19 +125,24 @@ impl MemoryFfmpegPipelineManager {
             "-map", "0:v:0",
             "-map", "0:a:0",
 
+            // HLS 설정 (2초 세그먼트)
             "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "10",
-            "-hls_flags", "independent_segments+program_date_time+temp_file",
+            "-hls_time", "2",         // 2초 세그먼트
+            "-hls_init_time", "2",
+            "-hls_list_size", "15",   // 플레이리스트에 15개 세그먼트 유지 (30초)
+            "-hls_flags", "independent_segments+program_date_time+temp_file+delete_segments",
 
+            // fMP4 컨테이너
             "-hls_segment_type", "fmp4",
             "-hls_fmp4_init_filename", "init.mp4",
             "-hls_segment_filename", &segment_filename_pattern,
 
-            "-hls_playlist_type", "event",
+            // fMP4 최적화 (1초 fragment = 세그먼트당 2개 moof)
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+            "-frag_duration", "1000000",  // 1초 fragment (마이크로초)
+
             "-hls_allow_cache", "0",
             "-hls_start_number_source", "datetime",
-            "-movflags", "+frag_keyframe+empty_moov+faststart+default_base_moof",
             &playlist_path,
         ]);
 
@@ -199,14 +199,11 @@ impl MemoryFfmpegPipelineManager {
                 handle.abort();
             }
 
-            // 메모리 버퍼 정리
-            self.buffer_manager.remove_stream(&pipeline.stream_name).await?;
-
-            // 임시 디렉토리 정리
+            // 출력 디렉토리 정리
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
             let _ = fs::remove_dir_all(&temp_dir).await;
 
-            info!("Memory-based FFmpeg pipeline stopped for stream {}", stream_id);
+            info!("FFmpeg pipeline stopped for stream {}", stream_id);
         }
         Ok(())
     }
@@ -218,11 +215,10 @@ impl MemoryFfmpegPipelineManager {
             if let Some(handle) = pipeline.watcher_handle.take() {
                 handle.abort();
             }
-            self.buffer_manager.remove_stream(&pipeline.stream_name).await?;
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
             let _ = fs::remove_dir_all(&temp_dir).await;
         }
-        info!("All memory-based FFmpeg pipelines stopped");
+        info!("All FFmpeg pipelines stopped");
         Ok(())
     }
 
@@ -236,10 +232,5 @@ impl MemoryFfmpegPipelineManager {
     pub async fn active_pipeline_count(&self) -> usize {
         let pipelines = self.pipelines.read().await;
         pipelines.len()
-    }
-
-    /// 메모리 사용량 조회
-    pub async fn get_memory_stats(&self) -> (usize, usize) {
-        self.buffer_manager.get_memory_usage().await
     }
 }

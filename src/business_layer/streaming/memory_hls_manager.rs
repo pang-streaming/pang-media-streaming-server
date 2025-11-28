@@ -5,19 +5,14 @@ use chrono::Utc;
 use log::{error, info, warn};
 
 use crate::config::{ApiConfig, Config};
-use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
-use crate::data_layer::storage::memory_s3_uploader::{MemoryS3Uploader, MemorySegment};
+use crate::data_layer::storage::cli_s3_uploader::CliS3Uploader;
 use super::ffmpeg_pipeline::MemoryFfmpegPipelineManager;
 use super::master_playlist_generator::{MasterPlaylistGenerator, ReplayManager, StreamMetadata};
 
-use aws_sdk_s3::Client as S3Client;
-
-/// 메모리 기반 HLS 변환 관리자
+/// 파일 기반 HLS 변환 관리자 (AWS CLI 사용)
 pub struct MemoryHlsManager {
     ffmpeg_manager: Arc<MemoryFfmpegPipelineManager>,
-    buffer_manager: Arc<MemoryBufferManager>,
-    s3_uploader: Arc<MemoryS3Uploader>,
-    s3_client: Arc<S3Client>, 
+    s3_uploader: Arc<CliS3Uploader>,
     master_generator: Arc<MasterPlaylistGenerator>,
     replay_manager: Arc<tokio::sync::RwLock<ReplayManager>>,
     stream_metadata: Arc<tokio::sync::RwLock<HashMap<String, StreamMetadata>>>,
@@ -30,135 +25,67 @@ impl MemoryHlsManager {
     pub async fn new(
         config: Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // S3 클라이언트 생성 (최적화된 설정)
-        use aws_credential_types::Credentials;
-        use aws_sdk_s3::config::{
-            timeout::TimeoutConfig, BehaviorVersion, Region, StalledStreamProtectionConfig,
-            retry::RetryConfig,
-        };
-        use std::time::Duration;
+        // AWS CLI용 환경변수 설정 (프로세스 시작 시 한번만 실행되므로 안전)
+        // SAFETY: 이 코드는 싱글스레드 초기화 시점에 실행됨
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", &config.s3.access_key);
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", &config.s3.secret_access_key);
+            std::env::set_var("AWS_DEFAULT_REGION", &config.s3.region);
+        }
+        info!("AWS credentials configured for CLI");
 
-        let credentials = Credentials::new(
-            &config.s3.access_key,
-            &config.s3.secret_access_key,
-            None,
-            None,
-            "static",
-        );
+        // AWS CLI 기반 S3 업로더 생성
+        let s3_uploader = Arc::new(CliS3Uploader::new(
+            config.s3.bucket.clone(),
+            config.s3.region.clone(),
+            None,  // endpoint_url (기본 S3 사용)
+            config.streaming.upload_workers.max(32),  // 최소 32 워커
+        ));
 
-        // 타임아웃 설정 (EC2/로컬 환경 모두 대응)
-        let timeout_config = TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(15))      // 연결 타임아웃
-            .read_timeout(Duration::from_secs(60))         // 읽기 타임아웃
-            .operation_timeout(Duration::from_secs(120))   // 전체 작업 타임아웃
-            .operation_attempt_timeout(Duration::from_secs(60))  // 시도당 타임아웃
-            .build();
+        // AWS CLI 연결 테스트
+        info!("Testing AWS CLI S3 connection...");
+        let test_result = std::process::Command::new("aws")
+            .args(["s3", "ls", &format!("s3://{}", config.s3.bucket), "--max-items", "1"])
+            .args(["--region", &config.s3.region])
+            .output();
 
-        // 재시도 설정 (연결 끊김 대응 - 적극적 재시도)
-        let retry_config = RetryConfig::standard()
-            .with_max_attempts(10)                         // 최대 10회 재시도 (연결 문제 대응)
-            .with_initial_backoff(Duration::from_millis(50))   // 초기 백오프 50ms
-            .with_max_backoff(Duration::from_secs(3))      // 최대 백오프 3초
-            .with_reconnect_mode(aws_sdk_s3::config::retry::ReconnectMode::ReconnectOnTransientError);
-
-        // 느린 업로드로 인한 강제 종료 방지
-        let stalled_stream_config = StalledStreamProtectionConfig::disabled();
-
-        let s3_config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(config.s3.region.clone()))
-            .credentials_provider(credentials)
-            .timeout_config(timeout_config)
-            .retry_config(retry_config)
-            .stalled_stream_protection(stalled_stream_config)
-            .force_path_style(false)  // 가상 호스트 스타일 (S3 기본)
-            .build();
-
-        let s3_client = Arc::new(S3Client::from_conf(s3_config));
-
-        info!("S3 client initialized with optimized settings:");
-        info!("   - Max retry attempts: 5");
-        info!("   - Stalled stream protection: disabled");
-        info!("   - Operation timeout: 120s");
-
-        // S3 연결 테스트
-        info!("Testing S3 connection to bucket: {}", config.s3.bucket);
-        match s3_client
-            .list_objects_v2()
-            .bucket(&config.s3.bucket)
-            .max_keys(1)
-            .send()
-            .await
-        {
-            Ok(_) => info!("S3 connection successful!"),
+        match test_result {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("AWS CLI S3 connection successful!");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("AWS CLI S3 test warning: {}", stderr);
+                }
+            }
             Err(e) => {
-                error!("S3 connection failed: {:?}", e);
-                error!("   - Bucket name: {}", config.s3.bucket);
-                error!("   - Region: {}", config.s3.region);
-                error!(
-                    "   - Access key is configured: {}",
-                    !config.s3.access_key.is_empty()
-                );
-                error!(
-                    "   - Secret key is configured: {}",
-                    !config.s3.secret_access_key.is_empty()
-                );
+                error!("AWS CLI not found or failed: {}", e);
+                error!("Make sure AWS CLI is installed and configured");
             }
         }
 
-        // 메모리 버퍼 관리자 생성 (config 기반)
-        let buffer_manager = Arc::new(MemoryBufferManager::new(
-            config.streaming.memory_buffer_mb,
-            config.streaming.max_segments_per_stream,
+        // FFmpeg 파이프라인 관리자 생성 (파일 기반)
+        let ffmpeg_manager = Arc::new(MemoryFfmpegPipelineManager::new(
+            config.clone(),
+            s3_uploader.clone(),
         ));
 
-        // 메모리 S3 업로더 생성 (config 기반)
-        let s3_uploader = Arc::new(
-            MemoryS3Uploader::new(
-                s3_client.clone(),
-                config.s3.bucket.clone(),
-                config.streaming.upload_workers,
-            )
-                .await?,
-        );
-
-        // 메모리 FFmpeg 파이프라인 관리자 생성
-        let ffmpeg_manager =
-            Arc::new(MemoryFfmpegPipelineManager::new(
-                config.clone(),
-                buffer_manager.clone(),
-                s3_uploader.clone(),
-            ));
-
         // 마스터 플레이리스트 생성기
-        let bucket_url =
-            format!("https://{}.s3.ap-northeast-2.amazonaws.com", config.s3.bucket);
+        let bucket_url = format!("https://{}.s3.{}.amazonaws.com", config.s3.bucket, config.s3.region);
         let master_generator = Arc::new(MasterPlaylistGenerator::new(bucket_url));
 
         // 리플레이 매니저
         let replay_manager = Arc::new(tokio::sync::RwLock::new(ReplayManager::new()));
         let stream_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-        info!("Memory-based HLS Manager initialized");
-        info!(
-            "   - Max buffer size: {}MB",
-            config.streaming.memory_buffer_mb
-        );
-        info!(
-            "   - Max segments per stream: {}",
-            config.streaming.max_segments_per_stream
-        );
-        info!(
-            "   - S3 upload workers: {}",
-            config.streaming.upload_workers
-        );
+        info!("AWS CLI-based HLS Manager initialized");
+        info!("   - S3 upload workers: {}", config.streaming.upload_workers.max(32));
         info!("   - Bucket: {}", config.s3.bucket);
+        info!("   - Region: {}", config.s3.region);
 
         Ok(Self {
             ffmpeg_manager,
-            buffer_manager,
             s3_uploader,
-            s3_client,
             master_generator,
             replay_manager,
             stream_metadata,
@@ -173,12 +100,7 @@ impl MemoryHlsManager {
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 메모리 버퍼에 스트림 생성
-        self.buffer_manager
-            .create_stream(stream_name.to_string())
-            .await?;
-
-        // FFmpeg 파이프라인 시작 (자동으로 메모리에 쓰고 S3에 업로드)
+        // FFmpeg 파이프라인 시작 (파일 기반으로 S3에 업로드)
         self.ffmpeg_manager
             .start_pipeline(stream_id, stream_name)
             .await?;
@@ -202,10 +124,9 @@ impl MemoryHlsManager {
         }
 
         info!(
-            "Memory-based HLS conversion started for stream {} ({})",
+            "File-based HLS conversion started for stream {} ({})",
             stream_id, stream_name
         );
-        info!("Segments use epoch-based numbering (no conflicts)");
         Ok(())
     }
 
@@ -217,13 +138,6 @@ impl MemoryHlsManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // FFmpeg 파이프라인 중지
         self.ffmpeg_manager.stop_pipeline(stream_id).await?;
-
-        // 남은 세그먼트 모두 업로드
-        if let Some(data) = self.buffer_manager.get_stream_data(stream_name).await {
-            self.s3_uploader
-                .upload_stream_from_memory(stream_name, data)
-                .await?;
-        }
 
         // VOD 플레이리스트 생성 및 업로드
         self.generate_vod_playlist(stream_name).await?;
@@ -243,11 +157,8 @@ impl MemoryHlsManager {
             }
         }
 
-        // 메모리 버퍼 정리 (리플레이를 위해 S3에는 유지)
-        self.buffer_manager.remove_stream(stream_name).await?;
-
         info!(
-            "Memory-based HLS conversion stopped for stream {} ({})",
+            "File-based HLS conversion stopped for stream {} ({})",
             stream_id, stream_name
         );
         info!("Stream is now available for replay");
@@ -263,19 +174,13 @@ impl MemoryHlsManager {
         self.ffmpeg_manager.send_data(stream_id, data).await
     }
 
-    /// 스트림을 S3에 업로드 (이미 자동으로 업로드되지만 수동 트리거용)
+    /// 스트림을 S3에 업로드 (파일 기반에서는 자동 업로드됨)
     pub async fn upload_stream_to_s3(
         &self,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(data) = self.buffer_manager.get_stream_data(stream_name).await {
-            self.s3_uploader
-                .upload_stream_from_memory(stream_name, data)
-                .await?;
-            info!("Manual upload triggered for stream: {}", stream_name);
-        } else {
-            warn!("No data found for stream: {}", stream_name);
-        }
+        // 파일 기반 시스템에서는 file_watcher가 자동으로 S3에 업로드
+        info!("File-based upload - stream {} is auto-uploaded via file watcher", stream_name);
         Ok(())
     }
 
@@ -311,16 +216,14 @@ impl MemoryHlsManager {
         self.ffmpeg_manager.has_pipeline(stream_id).await
     }
 
-    /// 메모리 사용량 통계
+    /// 메모리 사용량 통계 (파일 기반에서는 최소 메모리 사용)
     pub async fn get_memory_stats(&self) -> MemoryStats {
-        let (used, max) = self.buffer_manager.get_memory_usage().await;
-        let buffer_stats = self.buffer_manager.get_stats().await;
-
+        // 파일 기반 시스템에서는 메모리 버퍼를 사용하지 않음
         MemoryStats {
-            used_bytes: used,
-            max_bytes: max,
-            usage_percentage: (used as f64 / max as f64 * 100.0) as u32,
-            streams: buffer_stats,
+            used_bytes: 0,
+            max_bytes: 0,
+            usage_percentage: 0,
+            streams: HashMap::new(),
         }
     }
 
@@ -372,16 +275,15 @@ impl MemoryHlsManager {
         playlist.push_str(&format!("{}/vod_playlist.m3u8\n", base_url));
 
         // Master 플레이리스트 업로드
-        let segment = MemorySegment {
-            stream_name: stream_name.to_string(),
-            file_name: "master.m3u8".to_string(),
-            data: playlist.into_bytes(),
-            content_type: "application/vnd.apple.mpegurl".to_string(),
-            priority: 255,
-            created_at: Utc::now(),
-            retry_count: 0,
-        };
-        self.s3_uploader.queue_segment(segment).await;
+        if let Err(e) = self.s3_uploader.queue_data(
+            stream_name,
+            "master.m3u8",
+            playlist.into_bytes(),
+            "application/vnd.apple.mpegurl",
+            255,
+        ).await {
+            error!("Failed to upload master playlist: {:?}", e);
+        }
 
         info!("Master playlist (VOD) generated for stream: {}", stream_name);
         Ok(())
@@ -392,93 +294,102 @@ impl MemoryHlsManager {
         &self,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = self.s3_client.clone();
+        let bucket = self.config.s3.bucket.clone();
+        let region = self.config.s3.region.clone();
 
-        // S3에서 모든 세그먼트 파일 목록 가져오기
+        // AWS CLI로 S3에서 모든 세그먼트 파일 목록 가져오기
         let prefix = format!("{}/", stream_name);
-        let list_result = client
-            .list_objects_v2()
-            .bucket(&self.config.s3.bucket)
-            .prefix(&prefix)
-            .send()
-            .await;
+        let s3_path = format!("s3://{}/{}", bucket, prefix);
+
+        let list_result = std::process::Command::new("aws")
+            .args(["s3", "ls", &s3_path, "--region", &region])
+            .output();
 
         match list_result {
             Ok(output) => {
+                if !output.status.success() {
+                    error!("Failed to list segments for VOD playlist");
+                    return Ok(());
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
                 let mut segments = Vec::new();
                 let mut init_segment = None;
-                let target_duration: f32 = 1.0;
+                let target_duration: f32 = 2.0;
 
-                if let Some(objects) = output.contents {
-                    // 세그먼트 파일 수집 및 정렬
-                    for obj in objects {
-                        if let Some(key) = obj.key {
-                            let file_name = key.strip_prefix(&prefix).unwrap_or(&key);
+                // AWS CLI 출력 파싱 (형식: "2024-01-01 00:00:00 1234 filename")
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let file_name = parts[3];
 
-                            if file_name == "init.mp4" {
-                                init_segment = Some(file_name.to_string());
-                            } else if file_name.starts_with("segment_")
-                                && file_name.ends_with(".m4s")
-                            {
+                        if file_name == "init.mp4" {
+                            init_segment = Some(file_name.to_string());
+                        } else if file_name.starts_with("segment_")
+                            && file_name.ends_with(".m4s")
+                        {
+                            if (!file_name.ends_with("part1.m4s")
+                                && !file_name.ends_with("part0.m4s")
+                            ) {
                                 segments.push(file_name.to_string());
                             }
+
                         }
                     }
-
-                    // 세그먼트를 시간 순으로 정렬
-                    segments.sort();
-
-                    // VOD 플레이리스트 생성
-                    let mut vod_content = String::new();
-
-                    // HLS 헤더
-                    vod_content.push_str("#EXTM3U\n");
-                    vod_content.push_str("#EXT-X-VERSION:7\n");
-                    vod_content.push_str(&format!(
-                        "#EXT-X-TARGETDURATION:{}\n",
-                        target_duration.ceil() as i32
-                    ));
-                    vod_content.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-                    vod_content.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-
-                    // init 세그먼트
-                    if let Some(init) = init_segment {
-                        vod_content.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init));
-                    }
-
-                    vod_content.push_str("\n");
-
-                    // 모든 세그먼트 추가
-                    let base_url = format!(
-                        "https://{}.s3.ap-northeast-2.amazonaws.com/{}",
-                        self.config.s3.bucket, stream_name
-                    );
-
-                    for segment in segments {
-                        vod_content.push_str(&format!("#EXTINF:{:.6},\n", target_duration));
-                        vod_content.push_str(&format!("{}/{}\n", base_url, segment));
-                    }
-
-                    // 종료 태그
-                    vod_content.push_str("#EXT-X-ENDLIST\n");
-
-                    // VOD 플레이리스트 업로드
-                    let segment = MemorySegment {
-                        stream_name: stream_name.to_string(),
-                        file_name: "vod_playlist.m3u8".to_string(),
-                        data: vod_content.into_bytes(),
-                        content_type: "application/vnd.apple.mpegurl".to_string(),
-                        priority: 255,
-                        created_at: Utc::now(),
-                        retry_count: 0,
-                    };
-                    self.s3_uploader.queue_segment(segment).await;
-
-                    info!(
-                        "VOD playlist generated with all segments for stream: {}",
-                        stream_name
-                    );
                 }
+
+                // 세그먼트를 시간 순으로 정렬
+                segments.sort();
+
+                // VOD 플레이리스트 생성
+                let mut vod_content = String::new();
+
+                // HLS 헤더
+                vod_content.push_str("#EXTM3U\n");
+                vod_content.push_str("#EXT-X-VERSION:7\n");
+                vod_content.push_str(&format!(
+                    "#EXT-X-TARGETDURATION:{}\n",
+                    target_duration.ceil() as i32
+                ));
+                vod_content.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+                vod_content.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+
+                // init 세그먼트
+                if let Some(init) = init_segment {
+                    vod_content.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init));
+                }
+
+                vod_content.push_str("\n");
+
+                // 모든 세그먼트 추가
+                let base_url = format!(
+                    "https://{}.s3.{}.amazonaws.com/{}",
+                    bucket, region, stream_name
+                );
+
+                for segment in &segments {
+                    vod_content.push_str(&format!("#EXTINF:{:.6},\n", target_duration));
+                    vod_content.push_str(&format!("{}/{}\n", base_url, segment));
+                }
+
+                // 종료 태그
+                vod_content.push_str("#EXT-X-ENDLIST\n");
+
+                // VOD 플레이리스트 업로드
+                if let Err(e) = self.s3_uploader.queue_data(
+                    stream_name,
+                    "vod_playlist.m3u8",
+                    vod_content.into_bytes(),
+                    "application/vnd.apple.mpegurl",
+                    255,
+                ).await {
+                    error!("Failed to upload VOD playlist: {:?}", e);
+                }
+
+                info!(
+                    "VOD playlist generated with {} segments for stream: {}",
+                    segments.len(), stream_name
+                );
             }
             Err(e) => {
                 error!("Failed to list segments for VOD playlist: {:?}", e);
@@ -491,40 +402,27 @@ impl MemoryHlsManager {
     /// S3에서 기존 스트림 파일 정리 (선택적 - 수동 호출용)
     #[allow(dead_code)]
     pub async fn cleanup_s3_stream(&self, stream_name: &str) {
-        let client = self.s3_client.clone();
+        let bucket = &self.config.s3.bucket;
+        let region = &self.config.s3.region;
+        let s3_path = format!("s3://{}/{}/", bucket, stream_name);
 
-        // 스트림 디렉토리의 모든 객체 나열
-        let prefix = format!("{}/", stream_name);
-        match client
-            .list_objects_v2()
-            .bucket(&self.config.s3.bucket)
-            .prefix(&prefix)
-            .send()
-            .await
+        info!("Cleaning up S3 stream: {}", s3_path);
+
+        // AWS CLI로 디렉토리 삭제
+        match std::process::Command::new("aws")
+            .args(["s3", "rm", &s3_path, "--recursive", "--region", region])
+            .output()
         {
             Ok(output) => {
-                if let Some(objects) = output.contents {
-                    info!("   Found {} existing files to clean up", objects.len());
-
-                    for obj in objects {
-                        if let Some(key) = obj.key {
-                            // 각 객체 삭제
-                            match client
-                                .delete_object()
-                                .bucket(&self.config.s3.bucket)
-                                .key(&key)
-                                .send()
-                                .await
-                            {
-                                Ok(_) => info!("Deleted: {}", key),
-                                Err(e) => error!("Failed to delete {}: {:?}", key, e),
-                            }
-                        }
-                    }
+                if output.status.success() {
+                    info!("Successfully cleaned up S3 stream: {}", stream_name);
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("S3 cleanup warning: {}", stderr);
                 }
             }
             Err(e) => {
-                warn!("Could not list objects for cleanup: {:?}", e);
+                error!("Failed to cleanup S3 stream: {:?}", e);
             }
         }
     }
