@@ -6,50 +6,45 @@ use std::io::Write;
 use tokio::fs;
 use log::{info, error};
 use crate::config::Config;
-use crate::data_layer::storage::memory_buffer_manager::MemoryBufferManager;
-use crate::data_layer::storage::memory_s3_uploader::MemoryS3Uploader;
+use crate::data_layer::storage::cli_s3_uploader::CliS3Uploader;
 use super::pipeline::MemoryFfmpegPipeline;
 use super::file_watcher::start_file_watcher;
 
-/// 메모리 기반 FFmpeg 파이프라인 관리자
+/// 파일 기반 FFmpeg 파이프라인 관리자 (AWS CLI S3 업로드)
 pub struct MemoryFfmpegPipelineManager {
     pipelines: Arc<RwLock<HashMap<u32, MemoryFfmpegPipeline>>>,
     config: Config,
-    buffer_manager: Arc<MemoryBufferManager>,
-    s3_uploader: Arc<MemoryS3Uploader>,
+    s3_uploader: Arc<CliS3Uploader>,
 }
 
 impl MemoryFfmpegPipelineManager {
-    /// 새로운 메모리 기반 FFmpeg 파이프라인 관리자 생성
+    /// 새로운 파일 기반 FFmpeg 파이프라인 관리자 생성
     pub fn new(
         config: Config,
-        buffer_manager: Arc<MemoryBufferManager>,
-        s3_uploader: Arc<MemoryS3Uploader>,
+        s3_uploader: Arc<CliS3Uploader>,
     ) -> Self {
         Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             config,
-            buffer_manager,
             s3_uploader,
         }
     }
 
-    /// FFmpeg 파이프라인 시작 (메모리 버퍼 직접 연결)
+    /// FFmpeg 파이프라인 시작
     pub async fn start_pipeline(
         &self,
         stream_id: u32,
         stream_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 임시 출력 디렉토리 (FFmpeg는 파일 출력이 필요하지만, 즉시 메모리로 이동)
+        info!("[Pipeline] Starting for stream {} (id={})", stream_name, stream_id);
+
+        // 출력 디렉토리
         let temp_dir = format!("/tmp/hls_temp/{}", stream_name);
 
         // 기존 디렉토리가 있으면 삭제 (클린 스타트)
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         tokio::fs::create_dir_all(&temp_dir).await?;
-
-        // 메모리 버퍼에 스트림 생성 (기존 것 제거 후 새로 생성)
-        self.buffer_manager.remove_stream(stream_name).await?;
-        self.buffer_manager.create_stream(stream_name.to_string()).await?;
+        info!("[Pipeline] Output directory created: {}", temp_dir);
 
         // FFmpeg 명령어 구성
         let mut cmd = self.build_ffmpeg_command(stream_name, &temp_dir);
@@ -58,18 +53,20 @@ impl MemoryFfmpegPipelineManager {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
+        info!("[Pipeline] Spawning FFmpeg process...");
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
         let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+        info!("[Pipeline] FFmpeg process started");
 
-        // 파일 변경 감지 및 메모리로 이동
+        // 파일 변경 감지 및 S3 업로드
+        info!("[Pipeline] Starting file watcher for: {}", temp_dir);
         let watcher_handle = start_file_watcher(
             stream_name.to_string(),
             temp_dir.clone(),
-            Arc::clone(&self.buffer_manager),
             Arc::clone(&self.s3_uploader),
-            self.config.s3.bucket.clone(),
         ).await?;
+        info!("[Pipeline] File watcher started");
 
         let pipeline = MemoryFfmpegPipeline {
             stdin,
@@ -91,8 +88,9 @@ impl MemoryFfmpegPipelineManager {
         Ok(())
     }
 
-    /// FFmpeg 파이프라인 빌드
-    fn build_ffmpeg_command(&self, stream_name: &str, temp_dir: &str) -> Command {
+    /// FFmpeg 파이프라인 빌드 (LL-HLS 파트 직접 생성)
+    fn build_ffmpeg_command(&self, _stream_name: &str, temp_dir: &str) -> Command {
+        // datetime 기반 세그먼트 번호
         let segment_filename_pattern = format!(
             "{}/segment_%d.m4s",
             temp_dir
@@ -102,7 +100,9 @@ impl MemoryFfmpegPipelineManager {
 
         cmd.args([
             "-y",
+            "-f", "flv",
             "-i", "pipe:0",
+
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
@@ -111,22 +111,19 @@ impl MemoryFfmpegPipelineManager {
             "-maxrate", "5000k",
             "-bufsize", "10000k",
 
-            "-r", "60",
             "-g", "60",
             "-keyint_min", "60",
             "-sc_threshold", "0",
+
             "-c:a", "aac",
             "-b:a", "160k",
             "-ar", "44100",
             "-ac", "2",
 
-            "-map", "0:v:0",
-            "-map", "0:a:0",
-
             "-f", "hls",
             "-hls_time", "2",
             "-hls_list_size", "10",
-            "-hls_flags", "independent_segments+program_date_time+temp_file",
+            "-hls_flags", "independent_segments+program_date_time",
 
             "-hls_segment_type", "fmp4",
             "-hls_fmp4_init_filename", "init.mp4",
@@ -141,7 +138,6 @@ impl MemoryFfmpegPipelineManager {
 
         cmd
     }
-
     /// FFmpeg stderr 모니터링
     fn monitor_ffmpeg_stderr(&self, stream_id: u32, mut stderr: std::process::ChildStderr) {
         tokio::spawn(async move {
@@ -152,9 +148,13 @@ impl MemoryFfmpegPipelineManager {
                     Ok(0) => break,
                     Ok(n) => {
                         let output = String::from_utf8_lossy(&buffer[..n]);
-                        // 에러만 출력
-                        if output.contains("error") || output.contains("Error") {
-                            error!("FFmpeg[{}] Error: {}", stream_id, output.trim());
+                        // 모든 출력을 로깅 (디버깅용)
+                        for line in output.lines() {
+                            if line.contains("error") || line.contains("Error") {
+                                error!("FFmpeg[{}]: {}", stream_id, line);
+                            } else if !line.trim().is_empty() {
+                                info!("FFmpeg[{}]: {}", stream_id, line);
+                            }
                         }
                     }
                     Err(_) => break,
@@ -192,14 +192,11 @@ impl MemoryFfmpegPipelineManager {
                 handle.abort();
             }
 
-            // 메모리 버퍼 정리
-            self.buffer_manager.remove_stream(&pipeline.stream_name).await?;
-
-            // 임시 디렉토리 정리
+            // 출력 디렉토리 정리
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
             let _ = fs::remove_dir_all(&temp_dir).await;
 
-            info!("Memory-based FFmpeg pipeline stopped for stream {}", stream_id);
+            info!("FFmpeg pipeline stopped for stream {}", stream_id);
         }
         Ok(())
     }
@@ -211,11 +208,10 @@ impl MemoryFfmpegPipelineManager {
             if let Some(handle) = pipeline.watcher_handle.take() {
                 handle.abort();
             }
-            self.buffer_manager.remove_stream(&pipeline.stream_name).await?;
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
             let _ = fs::remove_dir_all(&temp_dir).await;
         }
-        info!("All memory-based FFmpeg pipelines stopped");
+        info!("All FFmpeg pipelines stopped");
         Ok(())
     }
 
@@ -229,10 +225,5 @@ impl MemoryFfmpegPipelineManager {
     pub async fn active_pipeline_count(&self) -> usize {
         let pipelines = self.pipelines.read().await;
         pipelines.len()
-    }
-
-    /// 메모리 사용량 조회
-    pub async fn get_memory_stats(&self) -> (usize, usize) {
-        self.buffer_manager.get_memory_usage().await
     }
 }
