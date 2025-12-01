@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use reqwest::Client;
 use log::{info, error};
 use scuffle_rtmp::session::server::{ServerSessionError, SessionHandler, SessionData};
-use crate::authentication_layer::auth::{authenticate_and_get_stream_id, stop_stream};
+use crate::authentication_layer::auth::{authenticate_and_get_stream_id, stop_stream };
 use crate::business_layer::streaming::hls_convertor::HlsConvertor;
 
 pub struct RtmpSessionHandler {
@@ -82,6 +82,10 @@ impl SessionHandler for RtmpSessionHandler {
     }
 
     async fn on_unpublish(&mut self, _stream_id: u32) -> Result<(), ServerSessionError> {
+        if let Some(ref stream_key) = self.stream_key {
+            stop_stream(stream_key, &self.http_client, self.hls_convertor.api_config()).await;
+        }
+
         let internal_id = match self.internal_stream_id {
             Some(id) => id,
             None => {
@@ -92,11 +96,6 @@ impl SessionHandler for RtmpSessionHandler {
 
         if let Err(e) = self.hls_convertor.stop_hls_conversion(internal_id, &name).await {
             error!("Failed to stop HLS conversion: {}", e);
-        }
-
-        // API 서버에 스트리밍 정지를 알립니다.
-        if let Some(ref stream_key) = self.stream_key {
-            stop_stream(stream_key, &self.http_client, self.hls_convertor.api_config()).await;
         }
 
         Ok(())
