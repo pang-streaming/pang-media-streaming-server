@@ -7,6 +7,7 @@ pub struct Config {
     pub streaming: StreamingConfig,
     pub api: ApiConfig,
     pub s3: S3Config,
+    pub thumbnail: ThumbnailConfig,
     pub bunny: BunnyConfig,
 }
 
@@ -40,11 +41,32 @@ pub struct S3Config {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct ThumbnailConfig {
+    pub enabled: bool,
+    pub interval_seconds: u32,  // 썸네일 생성 간격 (초)
+    pub width: u32,             // 썸네일 너비
+    pub height: u32,            // 썸네일 높이
+    pub quality: u32,           // FFmpeg -q:v 값 (1=최고, 5=보통)
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct BunnyConfig {
     pub storage_zone: String,
     pub api_key: String,
     pub pull_zone_id: Option<String>,
     pub cdn_hostname: Option<String>,  // CDN URL용 (예: myzone.b-cdn.net)
+}
+
+impl Default for ThumbnailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 5,
+            width: 320,
+            height: 180,
+            quality: 3,
+        }
+    }
 }
 
 impl Config {

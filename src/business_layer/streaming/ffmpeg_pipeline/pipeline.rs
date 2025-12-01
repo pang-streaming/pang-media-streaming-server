@@ -7,4 +7,5 @@ pub struct MemoryFfmpegPipeline {
     pub stream_id: u32,
     pub stream_name: String,
     pub watcher_handle: Option<JoinHandle<()>>,
+    pub thumbnail_handle: Option<JoinHandle<()>>,
 }

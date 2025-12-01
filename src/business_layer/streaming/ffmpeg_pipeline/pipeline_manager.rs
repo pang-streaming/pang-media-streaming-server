@@ -59,12 +59,13 @@ impl MemoryFfmpegPipelineManager {
         let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
         info!("[Pipeline] FFmpeg process started");
 
-        // 파일 변경 감지 및 S3 업로드
+        // 파일 변경 감지 및 S3 업로드 (썸네일 설정 전달)
         info!("[Pipeline] Starting file watcher for: {}", temp_dir);
         let watcher_handle = start_file_watcher(
             stream_name.to_string(),
             temp_dir.clone(),
             Arc::clone(&self.s3_uploader),
+            self.config.thumbnail.clone(),
         ).await?;
         info!("[Pipeline] File watcher started");
 
@@ -73,6 +74,7 @@ impl MemoryFfmpegPipelineManager {
             stream_id,
             stream_name: stream_name.to_string(),
             watcher_handle: Some(watcher_handle),
+            thumbnail_handle: None,
         };
 
         // 파이프라인 저장
@@ -121,7 +123,7 @@ impl MemoryFfmpegPipelineManager {
             "-ac", "2",
 
             "-f", "hls",
-            "-hls_time", "2",
+            "-hls_time", "1",
             "-hls_list_size", "10",
             "-hls_flags", "independent_segments+program_date_time",
 
@@ -138,6 +140,7 @@ impl MemoryFfmpegPipelineManager {
 
         cmd
     }
+
     /// FFmpeg stderr 모니터링
     fn monitor_ffmpeg_stderr(&self, stream_id: u32, mut stderr: std::process::ChildStderr) {
         tokio::spawn(async move {
@@ -192,6 +195,11 @@ impl MemoryFfmpegPipelineManager {
                 handle.abort();
             }
 
+            // 썸네일 watcher 종료
+            if let Some(handle) = pipeline.thumbnail_handle.take() {
+                handle.abort();
+            }
+
             // 출력 디렉토리 정리
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
             let _ = fs::remove_dir_all(&temp_dir).await;
@@ -206,6 +214,9 @@ impl MemoryFfmpegPipelineManager {
         let mut pipelines = self.pipelines.write().await;
         for (_, mut pipeline) in pipelines.drain() {
             if let Some(handle) = pipeline.watcher_handle.take() {
+                handle.abort();
+            }
+            if let Some(handle) = pipeline.thumbnail_handle.take() {
                 handle.abort();
             }
             let temp_dir = format!("/tmp/hls_temp/{}", pipeline.stream_name);
