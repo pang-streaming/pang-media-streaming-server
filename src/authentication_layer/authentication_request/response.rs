@@ -14,8 +14,8 @@ pub struct BaseStreamUserResponse {
 #[derive(Deserialize, Debug)]
 pub struct StreamUserResponse {
     username: String,
-    #[serde(rename = "createdAt")]
-    created_at: String
+    #[serde(rename = "startAt")]
+    start_at: String,
 }
 
 impl StreamUserResponse {
@@ -24,6 +24,6 @@ impl StreamUserResponse {
     }
 
     pub fn get_start_time(&self) -> String {
-        self.created_at.clone()
+        self.start_at.clone()
     }
 }
