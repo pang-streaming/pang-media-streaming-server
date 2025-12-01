@@ -16,7 +16,7 @@ pub async fn get_authentication(stream_key: &str, client: &Client, api_config: &
 
 pub async fn stop_authentication(stream_key: &str, client: &Client, api_config: &ApiConfig) -> Result<BaseStreamUserResponse, String> {
     let data = client
-        .post(format!("{}/stream", api_config.host))
+        .delete(format!("{}/stream", api_config.host))
         .header("X-Stream-Key", stream_key)
         .send().await
         .unwrap();
