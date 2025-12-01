@@ -4,7 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use reqwest::Client;
 use log::{info, error};
 use scuffle_rtmp::session::server::{ServerSessionError, SessionHandler, SessionData};
-use crate::authentication_layer::auth::{authenticate_and_get_stream_id, stop_stream };
+use crate::authentication_layer::auth::{authenticate_and_get_stream_id, stop_stream};
 use crate::business_layer::streaming::hls_convertor::HlsConvertor;
 
 pub struct RtmpSessionHandler {
