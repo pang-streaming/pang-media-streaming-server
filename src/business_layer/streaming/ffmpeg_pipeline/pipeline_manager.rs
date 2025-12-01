@@ -10,7 +10,7 @@ use crate::data_layer::storage::cli_s3_uploader::CliS3Uploader;
 use super::pipeline::MemoryFfmpegPipeline;
 use super::file_watcher::start_file_watcher;
 
-/// 파일 기반 FFmpeg 파이프라인 관리자
+/// 파일 기반 FFmpeg 파이프라인 관리자 (AWS CLI S3 업로드)
 pub struct MemoryFfmpegPipelineManager {
     pipelines: Arc<RwLock<HashMap<u32, MemoryFfmpegPipeline>>>,
     config: Config,
@@ -65,7 +65,6 @@ impl MemoryFfmpegPipelineManager {
             stream_name.to_string(),
             temp_dir.clone(),
             Arc::clone(&self.s3_uploader),
-            self.config.s3.bucket.clone(),
         ).await?;
         info!("[Pipeline] File watcher started");
 
@@ -91,6 +90,7 @@ impl MemoryFfmpegPipelineManager {
 
     /// FFmpeg 파이프라인 빌드 (LL-HLS 파트 직접 생성)
     fn build_ffmpeg_command(&self, _stream_name: &str, temp_dir: &str) -> Command {
+        // datetime 기반 세그먼트 번호
         let segment_filename_pattern = format!(
             "{}/segment_%d.m4s",
             temp_dir
@@ -100,55 +100,44 @@ impl MemoryFfmpegPipelineManager {
 
         cmd.args([
             "-y",
+            "-f", "flv",
             "-i", "pipe:0",
 
-            // 비디오 코덱 설정
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
+
             "-b:v", "5000k",
             "-maxrate", "5000k",
             "-bufsize", "10000k",
 
-            // 프레임 설정 (2초마다 키프레임)
-            "-r", "60",
-            "-g", "69",              // 2초마다 GOP (60fps * 2초)
-            "-keyint_min", "60",      // 최소 1초
+            "-g", "60",
+            "-keyint_min", "60",
             "-sc_threshold", "0",
 
-            // 오디오 설정
             "-c:a", "aac",
             "-b:a", "160k",
             "-ar", "44100",
             "-ac", "2",
 
-            "-map", "0:v:0",
-            "-map", "0:a:0",
-
-            // HLS 설정 (2초 세그먼트)
             "-f", "hls",
-            "-hls_time", "2",         // 2초 세그먼트
-            "-hls_init_time", "2",
-            "-hls_list_size", "15",   // 플레이리스트에 15개 세그먼트 유지 (30초)
-            "-hls_flags", "independent_segments+program_date_time+temp_file+delete_segments",
+            "-hls_time", "2",
+            "-hls_list_size", "10",
+            "-hls_flags", "independent_segments+program_date_time",
 
-            // fMP4 컨테이너
             "-hls_segment_type", "fmp4",
             "-hls_fmp4_init_filename", "init.mp4",
             "-hls_segment_filename", &segment_filename_pattern,
 
-            // fMP4 최적화 (1초 fragment = 세그먼트당 2개 moof)
-            "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-            "-frag_duration", "1000000",  // 1초 fragment (마이크로초)
-
+            "-hls_playlist_type", "event",
             "-hls_allow_cache", "0",
             "-hls_start_number_source", "datetime",
+            "-movflags", "+frag_keyframe+empty_moov+faststart+default_base_moof",
             &playlist_path,
         ]);
 
         cmd
     }
-
     /// FFmpeg stderr 모니터링
     fn monitor_ffmpeg_stderr(&self, stream_id: u32, mut stderr: std::process::ChildStderr) {
         tokio::spawn(async move {
@@ -159,9 +148,13 @@ impl MemoryFfmpegPipelineManager {
                     Ok(0) => break,
                     Ok(n) => {
                         let output = String::from_utf8_lossy(&buffer[..n]);
-                        // 에러만 출력
-                        if output.contains("error") || output.contains("Error") {
-                            error!("FFmpeg[{}] Error: {}", stream_id, output.trim());
+                        // 모든 출력을 로깅 (디버깅용)
+                        for line in output.lines() {
+                            if line.contains("error") || line.contains("Error") {
+                                error!("FFmpeg[{}]: {}", stream_id, line);
+                            } else if !line.trim().is_empty() {
+                                info!("FFmpeg[{}]: {}", stream_id, line);
+                            }
                         }
                     }
                     Err(_) => break,

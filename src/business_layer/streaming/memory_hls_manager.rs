@@ -39,6 +39,8 @@ impl MemoryHlsManager {
             config.s3.bucket.clone(),
             config.s3.region.clone(),
             None,  // endpoint_url (기본 S3 사용)
+            config.s3.access_key.clone(),
+            config.s3.secret_access_key.clone(),
             config.streaming.upload_workers.max(32),  // 최소 32 워커
         ));
 
@@ -327,13 +329,9 @@ impl MemoryHlsManager {
                             init_segment = Some(file_name.to_string());
                         } else if file_name.starts_with("segment_")
                             && file_name.ends_with(".m4s")
+                            && !file_name.contains("part")
                         {
-                            if (!file_name.ends_with("part1.m4s")
-                                && !file_name.ends_with("part0.m4s")
-                            ) {
-                                segments.push(file_name.to_string());
-                            }
-
+                            segments.push(file_name.to_string());
                         }
                     }
                 }

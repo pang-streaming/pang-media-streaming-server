@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, mpsc};
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::Utc;
@@ -75,23 +75,28 @@ impl MemoryS3Uploader {
 
     /// 세그먼트를 업로드 큐에 추가 (메모리에서 직접)
     pub async fn queue_segment(&self, segment: MemorySegment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut queue = self.upload_queue.write().await;
+        let queue_len = {
+            let mut queue = self.upload_queue.write().await;
 
-        // 우선순위에 따라 큐에 삽입
-        let insert_pos = queue.iter().position(|s| s.priority < segment.priority).unwrap_or(queue.len());
+            // 우선순위에 따라 큐에 삽입
+            let insert_pos = queue.iter().position(|s| s.priority < segment.priority).unwrap_or(queue.len());
 
-        info!("[S3 Queue] {} ({}KB, priority={}, queue_pos={}/{})",
-            segment.file_name,
-            segment.data.len() / 1024,
-            segment.priority,
-            insert_pos,
+            debug!("[S3 Queue] {} ({}KB, priority={}, queue_pos={}/{})",
+                segment.file_name,
+                segment.data.len() / 1024,
+                segment.priority,
+                insert_pos,
+                queue.len()
+            );
+
+            queue.insert(insert_pos, segment);
             queue.len()
-        );
+        };
 
-        queue.insert(insert_pos, segment.clone());
-
-        // 바로 업로드 작업 시작
-        self.spawn_upload_worker().await;
+        // 큐에 있는 모든 세그먼트에 대해 워커 생성 시도
+        for _ in 0..queue_len {
+            self.spawn_upload_worker().await;
+        }
 
         Ok(())
     }
@@ -106,14 +111,20 @@ impl MemoryS3Uploader {
         let max_retries = self.max_retries;
 
         tokio::spawn(async move {
-            // 동시 업로드 수 제한
-            let _permit = semaphore.acquire().await.ok()?;
+            // 세마포어 획득 시도 (논블로킹)
+            let permit = match semaphore.try_acquire() {
+                Ok(p) => p,
+                Err(_) => return, // 슬롯 없으면 종료 (다른 워커가 처리)
+            };
 
             // 큐에서 세그먼트 가져오기
             let segment = {
                 let mut q = queue.write().await;
-                q.pop_front()
-            }?;
+                match q.pop_front() {
+                    Some(s) => s,
+                    None => return, // 큐가 비어있으면 종료
+                }
+            };
 
             let key = format!("{}/{}", segment.stream_name, segment.file_name);
             let file_size_kb = segment.data.len() / 1024;
@@ -124,10 +135,10 @@ impl MemoryS3Uploader {
                 uploads.insert(key.clone(), UploadState::Uploading);
             }
 
-            info!("[S3 Start] {} ({}KB)", key, file_size_kb);
+            info!("[S3 Upload] {} ({}KB)", key, file_size_kb);
             let upload_start = std::time::Instant::now();
 
-            // 재시도 로직 (SDK가 이미 5회 재시도하므로 앱 레벨은 최소화)
+            // 재시도 로직
             let mut retry_count = 0;
             let mut last_error = None;
 
@@ -151,7 +162,8 @@ impl MemoryS3Uploader {
                         info!("[S3 Done] {} ({}KB) in {:?} ({:.2} MB/s)",
                             key, file_size_kb, elapsed, speed_mbps);
 
-                        return Some(());
+                        drop(permit);
+                        return;
                     }
                     Err(e) => {
                         retry_count += 1;
@@ -164,7 +176,6 @@ impl MemoryS3Uploader {
                                 ("SlowDown", 2000 * retry_count as u64)
                             } else if error_str.contains("connection") || error_str.contains("Connection")
                                    || error_str.contains("re-used") || error_str.contains("dispatch") {
-                                // 연결 끊김 - 연결 풀 새로고침 대기
                                 ("Connection", 500 * retry_count as u64)
                             } else if error_str.contains("timeout") || error_str.contains("Timeout") {
                                 ("Timeout", 1000 * retry_count as u64)
@@ -191,7 +202,8 @@ impl MemoryS3Uploader {
             error!("[S3 Failed] {} after {} attempts in {:?}: {}",
                 key, max_retries + 1, elapsed,
                 last_error.unwrap_or_default().chars().take(150).collect::<String>());
-            None
+
+            drop(permit);
         });
     }
 

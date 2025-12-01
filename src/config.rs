@@ -7,6 +7,7 @@ pub struct Config {
     pub streaming: StreamingConfig,
     pub api: ApiConfig,
     pub s3: S3Config,
+    pub bunny: BunnyConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,6 +37,14 @@ pub struct S3Config {
     pub access_key: String,
     pub secret_access_key: String,
     pub endpoint_uri: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BunnyConfig {
+    pub storage_zone: String,
+    pub api_key: String,
+    pub pull_zone_id: Option<String>,
+    pub cdn_hostname: Option<String>,  // CDN URL용 (예: myzone.b-cdn.net)
 }
 
 impl Config {

@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use log::{info, warn, error, debug};
+use chrono::Utc;
 
 /// 업로드 상태
 #[derive(Debug, Clone)]
@@ -12,11 +13,24 @@ pub enum UploadState {
     Failed(String),
 }
 
+/// 메모리 세그먼트 데이터 (MemoryS3Uploader와 호환)
+#[derive(Clone)]
+pub struct CliSegment {
+    pub stream_name: String,
+    pub file_name: String,
+    pub data: Vec<u8>,
+    pub content_type: String,
+    pub priority: u8,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
 /// AWS CLI 기반 S3 업로더
 pub struct CliS3Uploader {
     bucket: String,
     region: String,
     endpoint_url: Option<String>,
+    access_key: String,
+    secret_key: String,
     active_uploads: Arc<RwLock<HashMap<String, UploadState>>>,
     semaphore: Arc<Semaphore>,
     max_retries: u8,
@@ -27,52 +41,46 @@ impl CliS3Uploader {
         bucket: String,
         region: String,
         endpoint_url: Option<String>,
+        access_key: String,
+        secret_key: String,
         worker_count: usize,
     ) -> Self {
         let effective_workers = worker_count.max(32);
         info!("[CliS3Uploader] Initialized with {} concurrent uploads", effective_workers);
+        info!("[CliS3Uploader] Bucket: {}, Region: {}", bucket, region);
+        if let Some(ref ep) = endpoint_url {
+            info!("[CliS3Uploader] Endpoint: {}", ep);
+        }
 
         Self {
             bucket,
             region,
             endpoint_url,
+            access_key,
+            secret_key,
             active_uploads: Arc::new(RwLock::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(effective_workers)),
             max_retries: 3,
         }
     }
 
-    /// 데이터를 S3에 업로드 (AWS CLI 사용)
-    /// priority: 높을수록 우선 (100=최우선, 50=낮음)
-    pub async fn queue_data(
-        &self,
-        stream_name: &str,
-        file_name: &str,
-        data: Vec<u8>,
-        content_type: &str,
-        priority: u8,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let key = format!("{}/{}", stream_name, file_name);
-        let file_size_kb = data.len() / 1024;
+    /// 세그먼트를 업로드 (MemoryS3Uploader 호환 인터페이스)
+    pub async fn queue_segment(&self, segment: CliSegment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let key = format!("{}/{}", segment.stream_name, segment.file_name);
+        let file_size_kb = segment.data.len() / 1024;
 
-        debug!("[CLI S3 Queue] {} ({}KB) priority={}", file_name, file_size_kb, priority);
+        debug!("[CLI S3 Queue] {} ({}KB) priority={}", segment.file_name, file_size_kb, segment.priority);
 
         let bucket = self.bucket.clone();
         let region = self.region.clone();
         let endpoint_url = self.endpoint_url.clone();
+        let access_key = self.access_key.clone();
+        let secret_key = self.secret_key.clone();
         let semaphore = Arc::clone(&self.semaphore);
         let active_uploads = Arc::clone(&self.active_uploads);
         let max_retries = self.max_retries;
-        let content_type = content_type.to_string();
 
         tokio::spawn(async move {
-            // 우선순위 기반 지연: 낮은 우선순위 = 더 긴 대기
-            // priority 100 = 0ms, priority 50 = 50ms
-            let delay_ms = ((100 - priority.min(100)) as u64) * 1;
-            if delay_ms > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            }
-
             // 세마포어 획득
             let _permit = match semaphore.acquire().await {
                 Ok(p) => p,
@@ -93,7 +101,7 @@ impl CliS3Uploader {
 
             // 재시도 루프
             for attempt in 0..=max_retries {
-                match upload_with_cli(&bucket, &region, &endpoint_url, &key, &data, &content_type).await {
+                match upload_with_cli(&bucket, &region, &endpoint_url, &access_key, &secret_key, &key, &segment.data, &segment.content_type).await {
                     Ok(_) => {
                         let elapsed = upload_start.elapsed();
                         {
@@ -136,31 +144,24 @@ impl CliS3Uploader {
         Ok(())
     }
 
-    /// 디렉토리 전체를 S3에 동기화
-    pub async fn sync_directory(
+    /// 데이터를 직접 업로드 (queue_segment의 편의 메서드)
+    pub async fn queue_data(
         &self,
-        local_dir: &str,
-        s3_prefix: &str,
+        stream_name: &str,
+        file_name: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        priority: u8,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let s3_path = format!("s3://{}/{}", self.bucket, s3_prefix);
-
-        let mut cmd = Command::new("aws");
-        cmd.args(["s3", "sync", local_dir, &s3_path]);
-        cmd.args(["--region", &self.region]);
-
-        if let Some(ref endpoint) = self.endpoint_url {
-            cmd.args(["--endpoint-url", endpoint]);
-        }
-
-        let output = cmd.output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("S3 sync failed: {}", stderr).into());
-        }
-
-        info!("[CLI S3] Synced {} to {}", local_dir, s3_path);
-        Ok(())
+        let segment = CliSegment {
+            stream_name: stream_name.to_string(),
+            file_name: file_name.to_string(),
+            data,
+            content_type: content_type.to_string(),
+            priority,
+            created_at: Utc::now(),
+        };
+        self.queue_segment(segment).await
     }
 
     pub async fn pending_count(&self) -> usize {
@@ -178,6 +179,8 @@ async fn upload_with_cli(
     bucket: &str,
     region: &str,
     endpoint_url: &Option<String>,
+    access_key: &str,
+    secret_key: &str,
     key: &str,
     data: &[u8],
     content_type: &str,
@@ -189,16 +192,24 @@ async fn upload_with_cli(
     tokio::fs::write(&temp_path, data).await
         .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
-    // 클로저로 이동할 값들을 소유권 있는 String으로 변환
+    // 클로저로 이동할 값들
     let region_owned = region.to_string();
     let content_type_owned = content_type.to_string();
     let endpoint_url_owned = endpoint_url.clone();
+    let access_key_owned = access_key.to_string();
+    let secret_key_owned = secret_key.to_string();
     let key_owned = key.to_string();
     let temp_path_clone = temp_path.clone();
 
     // AWS CLI 실행
     let result = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("aws");
+
+        // config.toml의 자격증명을 환경변수로 전달
+        cmd.env("AWS_ACCESS_KEY_ID", &access_key_owned);
+        cmd.env("AWS_SECRET_ACCESS_KEY", &secret_key_owned);
+        cmd.env("AWS_DEFAULT_REGION", &region_owned);
+
         cmd.args(["s3", "cp", &temp_path_clone, &s3_path]);
         cmd.args(["--region", &region_owned]);
         cmd.args(["--content-type", &content_type_owned]);
@@ -214,7 +225,9 @@ async fn upload_with_cli(
         cmd.args(["--cache-control", cache_control]);
 
         if let Some(endpoint) = endpoint_url_owned {
-            cmd.args(["--endpoint-url", &endpoint]);
+            if !endpoint.is_empty() {
+                cmd.args(["--endpoint-url", &endpoint]);
+            }
         }
 
         let output = cmd.output();
